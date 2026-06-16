@@ -291,7 +291,7 @@ export default function Home() {
       <div style={styles.header}>
         <div style={styles.headerTop}>
           <div>
-            <div style={styles.eyebrow}>BETANO · TRACKER EN VIVO</div>
+            <div style={styles.eyebrow}>Apuestas · TRACKER EN VIVO</div>
             <h1 style={styles.title}>Mis apuestas</h1>
           </div>
         </div>
