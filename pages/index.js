@@ -6,7 +6,9 @@ import {
 import { supabase } from "../lib/supabaseClient";
 import {
   MARKETS, COMPETITIONS, STAKE_OPTIONS, STATUS, CLP, todayISO,
-  emptySelection, resolveMarket,
+  emptySelection, resolveMarket, BIAS_PATTERNS, CONFIDENCE_LEVELS,
+  EDGE_THRESHOLD, impliedProbability, calculateEdge, getVerdict,
+  LOSS_REASONS, WIN_FACTORS,
 } from "../lib/betting";
 
 export default function Home() {
@@ -27,6 +29,10 @@ export default function Home() {
     market: MARKETS[0],
     odds: "",
     stake: STAKE_OPTIONS[1].value,
+    biasPattern: BIAS_PATTERNS[BIAS_PATTERNS.length - 1].id, // "ninguno" por defecto
+    confidence: CONFIDENCE_LEVELS[1].id, // "media" por defecto
+    checklistForma: null,
+    checklistValor: null,
   });
 
   const [comboForm, setComboForm] = useState({
@@ -68,6 +74,10 @@ export default function Home() {
               odds: Number(s.cuota),
               status: s.estado,
               result: s.goles_local != null ? { homeGoals: s.goles_local, awayGoals: s.goles_visitante } : null,
+              razonResultado: s.razon_resultado || null,
+              biasPattern: s.patron_sesgo || null,
+              confidence: s.nivel_confianza || null,
+              edge: s.edge_calculado != null ? Number(s.edge_calculado) : null,
             })),
         }))
       );
@@ -87,6 +97,10 @@ export default function Home() {
       stakeAmount: Number(b.monto_apostado),
       status: b.estado,
       result: b.goles_local != null ? { homeGoals: b.goles_local, awayGoals: b.goles_visitante } : null,
+      razonResultado: b.razon_resultado || null,
+      biasPattern: b.patron_sesgo || null,
+      confidence: b.nivel_confianza || null,
+      edge: b.edge_calculado != null ? Number(b.edge_calculado) : null,
     };
   }
 
@@ -116,16 +130,59 @@ export default function Home() {
 
   const totalNetPL = singleStats.netPL + comboStats.netPL;
   const currentBankroll = bankroll + totalNetPL;
-  const activeStats = tab === "simples" ? singleStats : comboStats;
-  const decided = activeStats.won + activeStats.lost;
-  const winRate = decided > 0 ? (activeStats.won / decided) * 100 : 0;
-  const roi = activeStats.totalStaked > 0 ? (activeStats.netPL / activeStats.totalStaked) * 100 : 0;
+  const activeStats = tab === "simples" ? singleStats : tab === "combinadas" ? comboStats : null;
+  const decided = activeStats ? activeStats.won + activeStats.lost : 0;
+  const winRate = decided > 0 && activeStats ? (activeStats.won / decided) * 100 : 0;
+
+  // ── Panel de rendimiento: combina apuestas simples + selecciones de combinadas ──
+  const allDecidedItems = [
+    ...bets
+      .filter((b) => b.status === STATUS.WON || b.status === STATUS.LOST)
+      .map((b) => ({ market: b.market, competition: b.competition, stakePct: b.stakePct, status: b.status, razonResultado: b.razonResultado })),
+    ...combos.flatMap((c) =>
+      c.selections
+        .filter((s) => s.status === STATUS.WON || s.status === STATUS.LOST)
+        .map((s) => ({ market: s.market, competition: s.competition, stakePct: c.stakePct, status: s.status, razonResultado: s.razonResultado }))
+    ),
+  ];
+
+  function buildBreakdown(items, keyFn) {
+    const groups = {};
+    items.forEach((item) => {
+      const key = keyFn(item);
+      if (!groups[key]) groups[key] = { won: 0, lost: 0 };
+      if (item.status === STATUS.WON) groups[key].won += 1;
+      else groups[key].lost += 1;
+    });
+    return Object.entries(groups)
+      .map(([key, v]) => ({ key, won: v.won, lost: v.lost, total: v.won + v.lost, pct: (v.won / (v.won + v.lost)) * 100 }))
+      .sort((a, b) => b.total - a.total);
+  }
+
+  const byMarket = buildBreakdown(allDecidedItems, (i) => i.market);
+  const byLeague = buildBreakdown(allDecidedItems, (i) => i.competition);
+  const byStake = buildBreakdown(allDecidedItems, (i) => {
+    const opt = STAKE_OPTIONS.find((s) => s.value === i.stakePct);
+    return opt ? opt.label : `${(i.stakePct * 100).toFixed(1)}%`;
+  });
+  const lossReasonCounts = {};
+  allDecidedItems.filter((i) => i.status === STATUS.LOST && i.razonResultado).forEach((i) => {
+    lossReasonCounts[i.razonResultado] = (lossReasonCounts[i.razonResultado] || 0) + 1;
+  });
+  const byLossReason = Object.entries(lossReasonCounts).map(([reason, count]) => ({ reason, count })).sort((a, b) => b.count - a.count);
+  const overallDecided = allDecidedItems.length;
+  const overallWon = allDecidedItems.filter((i) => i.status === STATUS.WON).length;
+  const overallWinRate = overallDecided > 0 ? (overallWon / overallDecided) * 100 : 0;
+  const roi = activeStats && activeStats.totalStaked > 0 ? (activeStats.netPL / activeStats.totalStaked) * 100 : 0;
 
   // ── Crear apuesta simple ─────────────────────────────────────────────
   const addBet = async () => {
     if (!form.match.trim() || !form.odds) return;
     setSaving(true);
     const stakeAmount = Math.round(currentBankroll * form.stake);
+    const confidenceLevel = CONFIDENCE_LEVELS.find((c) => c.id === form.confidence);
+    const edge = calculateEdge(confidenceLevel.probability, parseFloat(form.odds));
+
     const { data, error } = await supabase
       .from("apuestas_simples")
       .insert({
@@ -137,13 +194,23 @@ export default function Home() {
         stake_pct: form.stake,
         monto_apostado: stakeAmount,
         estado: STATUS.PENDING,
+        patron_sesgo: form.biasPattern,
+        nivel_confianza: form.confidence,
+        edge_calculado: edge,
+        checklist_forma: form.checklistForma,
+        checklist_valor: form.checklistValor,
       })
       .select()
       .single();
 
     if (!error && data) {
       setBets([mapBetFromDb(data), ...bets]);
-      setForm({ ...form, match: "", odds: "" });
+      setForm({
+        ...form, match: "", odds: "",
+        biasPattern: BIAS_PATTERNS[BIAS_PATTERNS.length - 1].id,
+        confidence: CONFIDENCE_LEVELS[1].id,
+        checklistForma: null, checklistValor: null,
+      });
       setShowForm(false);
     }
     setSaving(false);
@@ -164,15 +231,22 @@ export default function Home() {
 
     if (comboError || !comboData) { setSaving(false); return; }
 
-    const selectionsToInsert = validSelections.map((s, idx) => ({
-      combinada_id: comboData.id,
-      competencia: s.competition,
-      partido: s.match.trim(),
-      mercado: s.market,
-      cuota: parseFloat(s.odds),
-      estado: STATUS.PENDING,
-      orden: idx,
-    }));
+    const selectionsToInsert = validSelections.map((s, idx) => {
+      const confidenceLevel = CONFIDENCE_LEVELS.find((c) => c.id === s.confidence) || CONFIDENCE_LEVELS[1];
+      const edge = calculateEdge(confidenceLevel.probability, parseFloat(s.odds));
+      return {
+        combinada_id: comboData.id,
+        competencia: s.competition,
+        partido: s.match.trim(),
+        mercado: s.market,
+        cuota: parseFloat(s.odds),
+        estado: STATUS.PENDING,
+        orden: idx,
+        patron_sesgo: s.biasPattern || BIAS_PATTERNS[BIAS_PATTERNS.length - 1].id,
+        nivel_confianza: s.confidence || CONFIDENCE_LEVELS[1].id,
+        edge_calculado: edge,
+      };
+    });
 
     const { data: selData } = await supabase.from("combinada_selecciones").insert(selectionsToInsert).select();
 
@@ -185,6 +259,8 @@ export default function Home() {
       selections: (selData || []).map((s) => ({
         id: s.id, competition: s.competencia, match: s.partido, market: s.mercado,
         odds: Number(s.cuota), status: s.estado, result: null,
+        biasPattern: s.patron_sesgo, confidence: s.nivel_confianza,
+        edge: s.edge_calculado != null ? Number(s.edge_calculado) : null,
       })),
     };
     setCombos([newCombo, ...combos]);
@@ -204,7 +280,7 @@ export default function Home() {
   };
 
   // ── Aplicar resultado manual a apuesta simple ───────────────────────
-  const applyResultToBet = async (betId, homeGoals, awayGoals) => {
+  const applyResultToBet = async (betId, homeGoals, awayGoals, reason) => {
     const bet = bets.find((b) => b.id === betId);
     if (!bet) return;
     const resolved = resolveMarket(bet.market, homeGoals, awayGoals, null, null);
@@ -212,14 +288,14 @@ export default function Home() {
 
     await supabase
       .from("apuestas_simples")
-      .update({ estado: newStatus, goles_local: homeGoals, goles_visitante: awayGoals })
+      .update({ estado: newStatus, goles_local: homeGoals, goles_visitante: awayGoals, razon_resultado: reason })
       .eq("id", betId);
 
-    setBets(bets.map((b) => (b.id === betId ? { ...b, status: newStatus, result: { homeGoals, awayGoals } } : b)));
+    setBets(bets.map((b) => (b.id === betId ? { ...b, status: newStatus, result: { homeGoals, awayGoals }, razonResultado: reason } : b)));
   };
 
   // ── Aplicar resultado manual a una selección de combinada ──────────
-  const applyResultToSelection = async (comboId, selId, homeGoals, awayGoals) => {
+  const applyResultToSelection = async (comboId, selId, homeGoals, awayGoals, reason) => {
     const combo = combos.find((c) => c.id === comboId);
     if (!combo) return;
     const sel = combo.selections.find((s) => s.id === selId);
@@ -229,11 +305,11 @@ export default function Home() {
 
     await supabase
       .from("combinada_selecciones")
-      .update({ estado: newSelStatus, goles_local: homeGoals, goles_visitante: awayGoals })
+      .update({ estado: newSelStatus, goles_local: homeGoals, goles_visitante: awayGoals, razon_resultado: reason })
       .eq("id", selId);
 
     const newSelections = combo.selections.map((s) =>
-      s.id === selId ? { ...s, status: newSelStatus, result: { homeGoals, awayGoals } } : s
+      s.id === selId ? { ...s, status: newSelStatus, result: { homeGoals, awayGoals }, razonResultado: reason } : s
     );
     const allDecided = newSelections.every((s) => s.status !== STATUS.PENDING);
     const anyLost = newSelections.some((s) => s.status === STATUS.LOST);
@@ -274,6 +350,12 @@ export default function Home() {
   };
   const comboPreviewOdds = comboForm.selections.filter((s) => s.odds).reduce((p, s) => p * parseFloat(s.odds || 1), 1);
 
+  // ── Cálculo en vivo del protocolo para el formulario de apuesta simple ──
+  const formConfidenceLevel = CONFIDENCE_LEVELS.find((c) => c.id === form.confidence);
+  const formImpliedProb = form.odds ? impliedProbability(parseFloat(form.odds)) : 0;
+  const formEdge = form.odds ? calculateEdge(formConfidenceLevel.probability, parseFloat(form.odds)) : null;
+  const formVerdict = formEdge != null ? getVerdict(formEdge) : null;
+
   if (loading) {
     return (
       <div style={styles.loadingScreen}>
@@ -291,7 +373,7 @@ export default function Home() {
       <div style={styles.header}>
         <div style={styles.headerTop}>
           <div>
-            <div style={styles.eyebrow}>Apuestas · TRACKER EN VIVO</div>
+            <div style={styles.eyebrow}>APUESTAS TRACKER · EN VIVO</div>
             <h1 style={styles.title}>Mis apuestas</h1>
           </div>
         </div>
@@ -320,15 +402,22 @@ export default function Home() {
         <button style={{ ...styles.tabBtn, ...(tab === "combinadas" ? styles.tabBtnActive : {}) }} onClick={() => { setTab("combinadas"); setShowForm(false); }}>
           <Layers size={13} /> Combinadas
         </button>
+        <button style={{ ...styles.tabBtn, ...(tab === "analisis" ? styles.tabBtnActive : {}) }} onClick={() => { setTab("analisis"); setShowForm(false); }}>
+          <Target size={13} /> Análisis
+        </button>
       </div>
 
-      <div style={styles.kpiRow}>
-        <KpiCard icon={<Target size={14} color="#D4A537" />} label="Acierto" value={decided > 0 ? `${winRate.toFixed(0)}%` : "—"} sub={`${activeStats.won}G · ${activeStats.lost}P`} />
-        <KpiCard icon={activeStats.netPL >= 0 ? <TrendingUp size={14} color="#3FA66B" /> : <TrendingDown size={14} color="#C75450" />}
-          label="P&L Neto" value={CLP(activeStats.netPL)} valueColor={activeStats.netPL >= 0 ? "#3FA66B" : "#C75450"} sub={`ROI ${roi.toFixed(1)}%`} />
-        <KpiCard icon={<Clock size={14} color="#9A9488" />} label="Pendientes" value={activeStats.pending} sub="por resolver" />
-      </div>
+      {activeStats && (
+        <div style={styles.kpiRow}>
+          <KpiCard icon={<Target size={14} color="#D4A537" />} label="Acierto" value={decided > 0 ? `${winRate.toFixed(0)}%` : "—"} sub={`${activeStats.won}G · ${activeStats.lost}P`} />
+          <KpiCard icon={activeStats.netPL >= 0 ? <TrendingUp size={14} color="#3FA66B" /> : <TrendingDown size={14} color="#C75450" />}
+            label="P&L Neto" value={CLP(activeStats.netPL)} valueColor={activeStats.netPL >= 0 ? "#3FA66B" : "#C75450"} sub={`ROI ${roi.toFixed(1)}%`} />
+          <KpiCard icon={<Clock size={14} color="#9A9488" />} label="Pendientes" value={activeStats.pending} sub="por resolver" />
+        </div>
+      )}
 
+      {(tab === "simples" || tab === "combinadas") && (
+      <>
       {!showForm ? (
         <button style={styles.addBtn} onClick={() => setShowForm(true)}>
           <Plus size={17} />
@@ -361,6 +450,70 @@ export default function Home() {
               </select>
             </div>
           </div>
+
+          <div style={styles.protocolBox}>
+            <div style={styles.protocolTitle}>Análisis de lo ya analizado</div>
+
+            <label style={styles.formLabel}>Paso 1 — ¿Qué patrón de sesgo detectas?</label>
+            <select value={form.biasPattern} onChange={(e) => setForm({ ...form, biasPattern: e.target.value })} style={styles.input}>
+              {BIAS_PATTERNS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
+            </select>
+            <div style={styles.protocolHint}>
+              {BIAS_PATTERNS.find((p) => p.id === form.biasPattern)?.hint}
+            </div>
+
+            <label style={styles.formLabel}>Paso 2 — Nivel de confianza</label>
+            <div style={styles.confidenceRow}>
+              {CONFIDENCE_LEVELS.map((c) => (
+                <button
+                  key={c.id}
+                  onClick={() => setForm({ ...form, confidence: c.id })}
+                  style={{ ...styles.confidenceBtn, ...(form.confidence === c.id ? styles.confidenceBtnActive : {}) }}
+                >
+                  {c.label}
+                </button>
+              ))}
+            </div>
+
+            {form.odds && (
+              <div style={styles.edgeBox}>
+                <div style={styles.edgeRow}>
+                  <span>Tu probabilidad</span>
+                  <strong>{(formConfidenceLevel.probability * 100).toFixed(0)}%</strong>
+                </div>
+                <div style={styles.edgeRow}>
+                  <span>Probabilidad implícita de la cuota</span>
+                  <strong>{(formImpliedProb * 100).toFixed(1)}%</strong>
+                </div>
+                <div style={styles.edgeRow}>
+                  <span>Edge</span>
+                  <strong style={{ color: formEdge >= 0 ? "#3FA66B" : "#C75450" }}>
+                    {formEdge >= 0 ? "+" : ""}{(formEdge * 100).toFixed(1)}%
+                  </strong>
+                </div>
+                <div style={{ ...styles.verdictBadge, ...(formVerdict === "apostar" ? styles.verdictGood : styles.verdictBad) }}>
+                  {formVerdict === "apostar" ? `✅ Apostar (Edge +${(formEdge * 100).toFixed(1)}%)` : `⚠️ Pasar (Edge ${(formEdge * 100).toFixed(1)}%)`}
+                </div>
+              </div>
+            )}
+
+            <label style={styles.formLabel}>Checklist rápido</label>
+            <div style={styles.checklistRow}>
+              <span style={styles.checklistQuestion}>¿Analizaste forma/contexto antes de ver la cuota?</span>
+              <div style={styles.checklistBtns}>
+                <button onClick={() => setForm({ ...form, checklistForma: true })} style={{ ...styles.miniBtn, ...(form.checklistForma === true ? styles.miniBtnActive : {}) }}>Sí</button>
+                <button onClick={() => setForm({ ...form, checklistForma: false })} style={{ ...styles.miniBtn, ...(form.checklistForma === false ? styles.miniBtnActiveNo : {}) }}>No</button>
+              </div>
+            </div>
+            <div style={styles.checklistRow}>
+              <span style={styles.checklistQuestion}>¿La cuota tiene valor real según tu estimación?</span>
+              <div style={styles.checklistBtns}>
+                <button onClick={() => setForm({ ...form, checklistValor: true })} style={{ ...styles.miniBtn, ...(form.checklistValor === true ? styles.miniBtnActive : {}) }}>Sí</button>
+                <button onClick={() => setForm({ ...form, checklistValor: false })} style={{ ...styles.miniBtn, ...(form.checklistValor === false ? styles.miniBtnActiveNo : {}) }}>No</button>
+              </div>
+            </div>
+          </div>
+
           {form.odds && (
             <div style={styles.stakePreview}>
               Apostarás <strong>{CLP(currentBankroll * form.stake)}</strong> · Retorno potencial <strong>{CLP(currentBankroll * form.stake * parseFloat(form.odds || 0))}</strong>
@@ -377,7 +530,12 @@ export default function Home() {
           <div style={styles.comboHint}>Máx. 3 selecciones · Ganas solo si TODAS aciertan</div>
           <label style={styles.formLabel}>Fecha</label>
           <input type="date" value={comboForm.date} onChange={(e) => setComboForm({ ...comboForm, date: e.target.value })} style={styles.input} />
-          {comboForm.selections.map((sel, idx) => (
+          {comboForm.selections.map((sel, idx) => {
+            const selConfidence = CONFIDENCE_LEVELS.find((c) => c.id === sel.confidence) || CONFIDENCE_LEVELS[1];
+            const selImplied = sel.odds ? impliedProbability(parseFloat(sel.odds)) : 0;
+            const selEdge = sel.odds ? calculateEdge(selConfidence.probability, parseFloat(sel.odds)) : null;
+            const selVerdict = selEdge != null ? getVerdict(selEdge) : null;
+            return (
             <div key={idx} style={styles.selectionBlock}>
               <div style={styles.selectionHeader}>
                 <span style={styles.selectionNum}>Selección {idx + 1}</span>
@@ -393,8 +551,29 @@ export default function Home() {
                 {MARKETS.map((m) => <option key={m} value={m}>{m}</option>)}
               </select>
               <input type="number" step="0.01" placeholder="Cuota (ej: 1.65)" value={sel.odds} onChange={(e) => updateSelection(idx, "odds", e.target.value)} style={{ ...styles.inputSmall, marginTop: 7 }} />
+
+              <select value={sel.biasPattern} onChange={(e) => updateSelection(idx, "biasPattern", e.target.value)} style={{ ...styles.inputSmall, marginTop: 7 }}>
+                {BIAS_PATTERNS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
+              </select>
+              <div style={styles.confidenceRowSmall}>
+                {CONFIDENCE_LEVELS.map((c) => (
+                  <button
+                    key={c.id}
+                    onClick={() => updateSelection(idx, "confidence", c.id)}
+                    style={{ ...styles.confidenceBtnSmall, ...(sel.confidence === c.id ? styles.confidenceBtnActive : {}) }}
+                  >
+                    {c.label.replace(" confianza", "")}
+                  </button>
+                ))}
+              </div>
+              {sel.odds && (
+                <div style={{ ...styles.verdictBadge, marginTop: 8, ...(selVerdict === "apostar" ? styles.verdictGood : styles.verdictBad) }}>
+                  {selVerdict === "apostar" ? `✅ Edge +${(selEdge * 100).toFixed(1)}%` : `⚠️ Edge ${(selEdge * 100).toFixed(1)}%`}
+                </div>
+              )}
             </div>
-          ))}
+            );
+          })}
           {comboForm.selections.length < 3 && (
             <button onClick={addSelection} style={styles.addSelectionBtn}><Plus size={13} /> Añadir selección</button>
           )}
@@ -422,10 +601,80 @@ export default function Home() {
           combos.map((combo) => <ComboCard key={combo.id} combo={combo} onApplyResult={applyResultToSelection} onDelete={() => deleteCombo(combo.id)} />)
         }
       </div>
+      </>
+      )}
+
+      {tab === "analisis" && (
+        <PerformancePanel
+          overallDecided={overallDecided}
+          overallWinRate={overallWinRate}
+          byMarket={byMarket}
+          byLeague={byLeague}
+          byStake={byStake}
+          byLossReason={byLossReason}
+        />
+      )}
 
       <div style={styles.footer}>
         Pídele a Claude en el chat que busque los resultados y aplícalos aquí con el botón ✓ de cada partido.
       </div>
+    </div>
+  );
+}
+
+function PerformancePanel({ overallDecided, overallWinRate, byMarket, byLeague, byStake, byLossReason }) {
+  if (overallDecided === 0) {
+    return (
+      <div style={styles.listSection}>
+        <EmptyState text="Aún no hay apuestas resueltas para analizar. Cuando apliques resultados, aquí verás tu rendimiento desglosado." />
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.listSection}>
+      <div style={styles.panelOverallCard}>
+        <div style={styles.panelOverallLabel}>Acierto general</div>
+        <div style={styles.panelOverallValue}>{overallWinRate.toFixed(0)}%</div>
+        <div style={styles.panelOverallSub}>{overallDecided} apuestas/selecciones resueltas</div>
+      </div>
+
+      <BreakdownSection title="% acierto por mercado" rows={byMarket} />
+      <BreakdownSection title="% acierto por liga/competencia" rows={byLeague} />
+      <BreakdownSection title="% acierto por nivel de stake" rows={byStake} />
+
+      <div style={styles.panelSectionTitle}>Causas de pérdida más comunes</div>
+      {byLossReason.length === 0 ? (
+        <div style={styles.panelEmptyHint}>Aún no hay causas registradas en tus apuestas perdidas.</div>
+      ) : (
+        byLossReason.map((r) => (
+          <div key={r.reason} style={styles.lossReasonRow}>
+            <span style={styles.lossReasonText}>{r.reason}</span>
+            <span style={styles.lossReasonCount}>{r.count}×</span>
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
+function BreakdownSection({ title, rows }) {
+  return (
+    <div style={{ marginBottom: 6 }}>
+      <div style={styles.panelSectionTitle}>{title}</div>
+      {rows.length === 0 ? (
+        <div style={styles.panelEmptyHint}>Sin datos suficientes todavía.</div>
+      ) : (
+        rows.map((row) => (
+          <div key={row.key} style={styles.breakdownRow}>
+            <span style={styles.breakdownKey}>{row.key}</span>
+            <div style={styles.breakdownBarWrap}>
+              <div style={{ ...styles.breakdownBar, width: `${row.pct}%`, background: row.pct >= 50 ? "#3FA66B" : "#C75450" }} />
+            </div>
+            <span style={styles.breakdownPct}>{row.pct.toFixed(0)}% ({row.won}/{row.total})</span>
+          </div>
+        ))
+      )}
     </div>
   );
 }
@@ -455,14 +704,25 @@ function BetCard({ bet, onApplyResult, onDelete }) {
   const [editing, setEditing] = useState(false);
   const [home, setHome] = useState("");
   const [away, setAway] = useState("");
+  const [pendingStatus, setPendingStatus] = useState(null); // null hasta calcular
+  const [reason, setReason] = useState("");
   const cfg = STATUS_CONFIG[bet.status] || STATUS_CONFIG[STATUS.PENDING];
   const pnl = bet.status === STATUS.WON ? bet.stakeAmount * bet.odds - bet.stakeAmount : bet.status === STATUS.LOST ? -bet.stakeAmount : 0;
 
-  const submit = () => {
+  const calculateStatus = () => {
     if (home === "" || away === "") return;
-    onApplyResult(bet.id, parseInt(home, 10), parseInt(away, 10));
-    setEditing(false);
+    const resolved = resolveMarket(bet.market, parseInt(home, 10), parseInt(away, 10), null, null);
+    setPendingStatus(resolved || STATUS.PENDING);
   };
+
+  const submit = () => {
+    onApplyResult(bet.id, parseInt(home, 10), parseInt(away, 10), reason || null);
+    setEditing(false);
+    setPendingStatus(null);
+    setReason("");
+  };
+
+  const reasonOptions = pendingStatus === STATUS.WON ? WIN_FACTORS : pendingStatus === STATUS.LOST ? LOSS_REASONS : [];
 
   return (
     <div style={{ ...styles.betCard, borderLeft: `3px solid ${cfg.color}` }}>
@@ -475,7 +735,8 @@ function BetCard({ bet, onApplyResult, onDelete }) {
       </div>
       <div style={styles.betMarket}>{bet.market} <span style={styles.betOdds}>@ {bet.odds.toFixed(2)}</span></div>
       {bet.result && <div style={styles.resultLine}>⚽ Marcador: {bet.result.homeGoals} – {bet.result.awayGoals}</div>}
-      {editing && (
+      {bet.razonResultado && <div style={styles.resultLine}>📋 {bet.razonResultado}</div>}
+      {editing && pendingStatus === null && (
         <div style={styles.scoreForm}>
           <div style={styles.scoreRow}>
             <span style={styles.scoreLabel}>Final</span>
@@ -485,7 +746,25 @@ function BetCard({ bet, onApplyResult, onDelete }) {
           </div>
           <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
             <button onClick={() => setEditing(false)} style={styles.scoreCancelBtn}>Cancelar</button>
-            <button onClick={submit} style={styles.scoreApplyBtn}>Aplicar resultado</button>
+            <button onClick={calculateStatus} style={styles.scoreApplyBtn}>Continuar</button>
+          </div>
+        </div>
+      )}
+      {editing && pendingStatus !== null && (
+        <div style={styles.reasonBox}>
+          <span style={styles.reasonLabel}>
+            Resultado: {pendingStatus === STATUS.WON ? "Ganado ✓" : pendingStatus === STATUS.LOST ? "Perdido ✗" : "Nulo"}
+            {reasonOptions.length > 0 && " — ¿por qué?"}
+          </span>
+          {reasonOptions.length > 0 && (
+            <select value={reason} onChange={(e) => setReason(e.target.value)} style={styles.reasonSelect}>
+              <option value="">Selecciona una razón…</option>
+              {reasonOptions.map((r) => <option key={r} value={r}>{r}</option>)}
+            </select>
+          )}
+          <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+            <button onClick={() => { setEditing(false); setPendingStatus(null); }} style={styles.scoreCancelBtn}>Cancelar</button>
+            <button onClick={submit} style={styles.scoreApplyBtn}>Guardar resultado</button>
           </div>
         </div>
       )}
@@ -507,13 +786,24 @@ function ComboSelectionRow({ combo, sel, onApplyResult }) {
   const [editing, setEditing] = useState(false);
   const [home, setHome] = useState("");
   const [away, setAway] = useState("");
+  const [pendingStatus, setPendingStatus] = useState(null);
+  const [reason, setReason] = useState("");
   const selCfg = STATUS_CONFIG[sel.status] || STATUS_CONFIG[STATUS.PENDING];
 
-  const submit = () => {
+  const calculateStatus = () => {
     if (home === "" || away === "") return;
-    onApplyResult(combo.id, sel.id, parseInt(home, 10), parseInt(away, 10));
-    setEditing(false);
+    const resolved = resolveMarket(sel.market, parseInt(home, 10), parseInt(away, 10), null, null);
+    setPendingStatus(resolved || STATUS.PENDING);
   };
+
+  const submit = () => {
+    onApplyResult(combo.id, sel.id, parseInt(home, 10), parseInt(away, 10), reason || null);
+    setEditing(false);
+    setPendingStatus(null);
+    setReason("");
+  };
+
+  const reasonOptions = pendingStatus === STATUS.WON ? WIN_FACTORS : pendingStatus === STATUS.LOST ? LOSS_REASONS : [];
 
   return (
     <div style={styles.selRow}>
@@ -522,7 +812,8 @@ function ComboSelectionRow({ combo, sel, onApplyResult }) {
         <div style={styles.selMatch}>{sel.match}</div>
         <div style={styles.selMarket}>{sel.market} <span style={styles.betOdds}>@ {sel.odds.toFixed(2)}</span></div>
         {sel.result && <div style={styles.selResult}>⚽ {sel.result.homeGoals} – {sel.result.awayGoals}</div>}
-        {editing && (
+        {sel.razonResultado && <div style={styles.selResult}>📋 {sel.razonResultado}</div>}
+        {editing && pendingStatus === null && (
           <div style={styles.scoreForm}>
             <div style={styles.scoreRow}>
               <span style={styles.scoreLabel}>Final</span>
@@ -532,7 +823,25 @@ function ComboSelectionRow({ combo, sel, onApplyResult }) {
             </div>
             <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
               <button onClick={() => setEditing(false)} style={styles.scoreCancelBtn}>Cancelar</button>
-              <button onClick={submit} style={styles.scoreApplyBtn}>Aplicar</button>
+              <button onClick={calculateStatus} style={styles.scoreApplyBtn}>Continuar</button>
+            </div>
+          </div>
+        )}
+        {editing && pendingStatus !== null && (
+          <div style={styles.reasonBox}>
+            <span style={styles.reasonLabel}>
+              {pendingStatus === STATUS.WON ? "Ganado ✓" : pendingStatus === STATUS.LOST ? "Perdido ✗" : "Nulo"}
+              {reasonOptions.length > 0 && " — ¿por qué?"}
+            </span>
+            {reasonOptions.length > 0 && (
+              <select value={reason} onChange={(e) => setReason(e.target.value)} style={styles.reasonSelect}>
+                <option value="">Selecciona una razón…</option>
+                {reasonOptions.map((r) => <option key={r} value={r}>{r}</option>)}
+              </select>
+            )}
+            <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+              <button onClick={() => { setEditing(false); setPendingStatus(null); }} style={styles.scoreCancelBtn}>Cancelar</button>
+              <button onClick={submit} style={styles.scoreApplyBtn}>Guardar</button>
             </div>
           </div>
         )}
@@ -644,4 +953,43 @@ const styles = {
   scoreCancelBtn: { flex: 1, background: "transparent", border: "1px solid rgba(255,255,255,0.12)", color: "#C9C2B3", borderRadius: 7, padding: "7px", fontSize: 11.5, fontWeight: 600, cursor: "pointer" },
   scoreApplyBtn: { flex: 1.6, background: "#D4A537", border: "none", color: "#14171B", borderRadius: 7, padding: "7px", fontSize: 11.5, fontWeight: 700, cursor: "pointer" },
   selEditBtn: { background: "rgba(212,165,55,0.12)", border: "none", color: "#D4A537", borderRadius: 6, width: 24, height: 24, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0 },
+
+  protocolBox: { marginTop: 14, background: "rgba(212,165,55,0.05)", border: "1px solid rgba(212,165,55,0.18)", borderRadius: 10, padding: 12 },
+  protocolTitle: { fontSize: 12.5, fontWeight: 700, color: "#D4A537", marginBottom: 4, letterSpacing: "0.02em" },
+  protocolHint: { fontSize: 10.5, color: "#9A9488", marginTop: 5, lineHeight: 1.4 },
+  confidenceRow: { display: "flex", gap: 6 },
+  confidenceRowSmall: { display: "flex", gap: 5, marginTop: 7 },
+  confidenceBtnSmall: { flex: 1, background: "#14171B", border: "1px solid rgba(255,255,255,0.1)", color: "#C9C2B3", borderRadius: 7, padding: "6px 3px", fontSize: 10, fontWeight: 600, cursor: "pointer" },
+  confidenceBtn: { flex: 1, background: "#14171B", border: "1px solid rgba(255,255,255,0.1)", color: "#C9C2B3", borderRadius: 8, padding: "8px 4px", fontSize: 11, fontWeight: 600, cursor: "pointer" },
+  confidenceBtnActive: { background: "rgba(212,165,55,0.18)", border: "1px solid #D4A537", color: "#D4A537" },
+  edgeBox: { marginTop: 12, background: "#14171B", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 9, padding: 10 },
+  edgeRow: { display: "flex", justifyContent: "space-between", fontSize: 11.5, color: "#C9C2B3", marginBottom: 5 },
+  verdictBadge: { textAlign: "center", marginTop: 6, padding: "8px", borderRadius: 7, fontSize: 12.5, fontWeight: 700 },
+  verdictGood: { background: "rgba(63,166,107,0.15)", color: "#3FA66B" },
+  verdictBad: { background: "rgba(199,84,80,0.15)", color: "#C75450" },
+  checklistRow: { marginTop: 10 },
+  checklistQuestion: { fontSize: 11.5, color: "#C9C2B3", display: "block", marginBottom: 6 },
+  checklistBtns: { display: "flex", gap: 6 },
+  miniBtn: { flex: 1, background: "#14171B", border: "1px solid rgba(255,255,255,0.1)", color: "#C9C2B3", borderRadius: 7, padding: "7px", fontSize: 11.5, fontWeight: 600, cursor: "pointer" },
+  miniBtnActive: { background: "rgba(63,166,107,0.15)", border: "1px solid #3FA66B", color: "#3FA66B" },
+  miniBtnActiveNo: { background: "rgba(199,84,80,0.15)", border: "1px solid #C75450", color: "#C75450" },
+
+  reasonBox: { background: "rgba(212,165,55,0.06)", border: "1px solid rgba(212,165,55,0.2)", borderRadius: 8, padding: 9, marginTop: 7 },
+  reasonLabel: { fontSize: 10.5, color: "#9A9488", marginBottom: 6, display: "block" },
+  reasonSelect: { width: "100%", background: "#14171B", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 7, padding: "7px 8px", color: "#F5F1E8", fontSize: 11.5, fontFamily: "inherit", boxSizing: "border-box" },
+
+  panelOverallCard: { background: "rgba(212,165,55,0.08)", border: "1px solid rgba(212,165,55,0.2)", borderRadius: 12, padding: "16px", textAlign: "center", marginBottom: 8 },
+  panelOverallLabel: { fontSize: 11.5, color: "#9A9488", fontWeight: 600, marginBottom: 4 },
+  panelOverallValue: { fontSize: 32, fontWeight: 700, color: "#D4A537", lineHeight: 1 },
+  panelOverallSub: { fontSize: 10.5, color: "#76705F", marginTop: 4 },
+  panelSectionTitle: { fontSize: 12, fontWeight: 700, color: "#F5F1E8", marginTop: 14, marginBottom: 8 },
+  panelEmptyHint: { fontSize: 11, color: "#76705F", fontStyle: "italic" },
+  breakdownRow: { display: "flex", alignItems: "center", gap: 8, marginBottom: 7 },
+  breakdownKey: { fontSize: 11, color: "#C9C2B3", width: 110, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  breakdownBarWrap: { flex: 1, height: 6, background: "rgba(255,255,255,0.06)", borderRadius: 4, overflow: "hidden" },
+  breakdownBar: { height: "100%", borderRadius: 4 },
+  breakdownPct: { fontSize: 10, color: "#9A9488", width: 70, flexShrink: 0, textAlign: "right" },
+  lossReasonRow: { display: "flex", justifyContent: "space-between", alignItems: "center", background: "#1B1E24", borderRadius: 8, padding: "8px 10px", marginBottom: 6 },
+  lossReasonText: { fontSize: 11.5, color: "#C9C2B3" },
+  lossReasonCount: { fontSize: 12, fontWeight: 700, color: "#C75450" },
 };
