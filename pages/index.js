@@ -1,14 +1,14 @@
 import React, { useState, useEffect } from "react";
 import {
   Plus, Trash2, TrendingUp, TrendingDown, Wallet, Target,
-  AlertCircle, CheckCircle2, XCircle, Clock, Loader2, Layers, Circle, X,
+  AlertCircle, CheckCircle2, XCircle, Clock, Loader2, Layers, Circle, X, ClipboardList,
 } from "lucide-react";
 import { supabase } from "../lib/supabaseClient";
 import {
   MARKETS, COMPETITIONS, STAKE_OPTIONS, STATUS, CLP, todayISO,
   emptySelection, resolveMarket, BIAS_PATTERNS, CONFIDENCE_LEVELS,
   EDGE_THRESHOLD, impliedProbability, calculateEdge, getVerdict,
-  LOSS_REASONS, WIN_FACTORS,
+  LOSS_REASONS, WIN_FACTORS, ADVANCED_CHECKLIST, emptyAdvancedChecklist,
 } from "../lib/betting";
 
 export default function Home() {
@@ -29,8 +29,8 @@ export default function Home() {
     market: MARKETS[0],
     odds: "",
     stake: STAKE_OPTIONS[1].value,
-    biasPattern: BIAS_PATTERNS[BIAS_PATTERNS.length - 1].id, // "ninguno" por defecto
-    confidence: CONFIDENCE_LEVELS[1].id, // "media" por defecto
+    biasPattern: BIAS_PATTERNS[BIAS_PATTERNS.length - 1].id,
+    confidence: CONFIDENCE_LEVELS[1].id,
     checklistForma: null,
     checklistValor: null,
   });
@@ -41,6 +41,19 @@ export default function Home() {
     selections: [emptySelection(), emptySelection()],
   });
 
+  // ── Estado del Checklist Avanzado ────────────────────────────────────
+  const [checklistForm, setChecklistForm] = useState({
+    date: todayISO(),
+    competition: COMPETITIONS[0],
+    match: "",
+    respuestas: emptyAdvancedChecklist(),
+    vinculoTipo: null,       // "simple" | "seleccion" | null
+    vinculoId: null,         // id de apuesta_simple o combinada_seleccion
+    guardado: false,
+    guardandoChecklist: false,
+  });
+  const [checklistsPendientes, setChecklistsPendientes] = useState([]);
+
   // ── Cargar datos desde Supabase al iniciar ───────────────────────────
   useEffect(() => {
     loadAll();
@@ -48,10 +61,11 @@ export default function Home() {
 
   async function loadAll() {
     setLoading(true);
-    const [bancaRes, simplesRes, combinadasRes] = await Promise.all([
+    const [bancaRes, simplesRes, combinadasRes, checklistsRes] = await Promise.all([
       supabase.from("banca").select("*").eq("id", 1).single(),
       supabase.from("apuestas_simples").select("*").order("creado_en", { ascending: false }),
       supabase.from("apuestas_combinadas").select("*, combinada_selecciones(*)").order("creado_en", { ascending: false }),
+      supabase.from("checklist_analisis").select("*").order("creado_en", { ascending: false }).limit(20),
     ]);
 
     if (bancaRes.data) setBankroll(Number(bancaRes.data.monto));
@@ -82,6 +96,7 @@ export default function Home() {
         }))
       );
     }
+    if (checklistsRes.data) setChecklistsPendientes(checklistsRes.data);
     setLoading(false);
   }
 
@@ -134,7 +149,7 @@ export default function Home() {
   const decided = activeStats ? activeStats.won + activeStats.lost : 0;
   const winRate = decided > 0 && activeStats ? (activeStats.won / decided) * 100 : 0;
 
-  // ── Panel de rendimiento: combina apuestas simples + selecciones de combinadas ──
+  // ── Panel de rendimiento ──────────────────────────────────────────────
   const allDecidedItems = [
     ...bets
       .filter((b) => b.status === STATUS.WON || b.status === STATUS.LOST)
@@ -204,6 +219,10 @@ export default function Home() {
       .single();
 
     if (!error && data) {
+      // Si venía del checklist avanzado, vincular
+      if (checklistForm.guardado && checklistForm.vinculoTipo === null) {
+        await vincularChecklist(data.id, null);
+      }
       setBets([mapBetFromDb(data), ...bets]);
       setForm({
         ...form, match: "", odds: "",
@@ -214,6 +233,69 @@ export default function Home() {
       setShowForm(false);
     }
     setSaving(false);
+  };
+
+  // ── Guardar checklist avanzado en Supabase ────────────────────────────
+  const saveChecklist = async (apuestaSimpleId = null, seleccionId = null) => {
+    if (!checklistForm.match.trim()) return;
+    setChecklistForm((prev) => ({ ...prev, guardandoChecklist: true }));
+
+    const { data, error } = await supabase
+      .from("checklist_analisis")
+      .insert({
+        fecha: checklistForm.date,
+        competencia: checklistForm.competition,
+        partido: checklistForm.match.trim(),
+        pregunta_1: checklistForm.respuestas.xg_vs_goles,
+        pregunta_2: checklistForm.respuestas.brecha_cuotas,
+        pregunta_3: checklistForm.respuestas.xg_concedido,
+        pregunta_4: checklistForm.respuestas.racha_presion,
+        pregunta_5: checklistForm.respuestas.forma_menos_favorito,
+        apuesta_simple_id: apuestaSimpleId,
+        seleccion_id: seleccionId,
+      })
+      .select()
+      .single();
+
+    if (!error && data) {
+      setChecklistsPendientes((prev) => [data, ...prev]);
+      setChecklistForm((prev) => ({ ...prev, guardado: true, guardandoChecklist: false }));
+    } else {
+      setChecklistForm((prev) => ({ ...prev, guardandoChecklist: false }));
+    }
+  };
+
+  const vincularChecklist = async (apuestaSimpleId, seleccionId) => {
+    const ultimoChecklist = checklistsPendientes[0];
+    if (!ultimoChecklist) return;
+    await supabase
+      .from("checklist_analisis")
+      .update({ apuesta_simple_id: apuestaSimpleId, seleccion_id: seleccionId })
+      .eq("id", ultimoChecklist.id);
+  };
+
+  const resetChecklist = () => {
+    setChecklistForm({
+      date: todayISO(),
+      competition: COMPETITIONS[0],
+      match: "",
+      respuestas: emptyAdvancedChecklist(),
+      vinculoTipo: null,
+      vinculoId: null,
+      guardado: false,
+      guardandoChecklist: false,
+    });
+  };
+
+  const irACrearApuesta = () => {
+    setTab("simples");
+    setShowForm(true);
+    setForm((prev) => ({
+      ...prev,
+      competition: checklistForm.competition,
+      match: checklistForm.match,
+      date: checklistForm.date,
+    }));
   };
 
   // ── Crear combinada ──────────────────────────────────────────────────
@@ -319,7 +401,6 @@ export default function Home() {
     else if (allDecided && allWonOrVoid) comboStatus = STATUS.WON;
 
     await supabase.from("apuestas_combinadas").update({ estado: comboStatus }).eq("id", comboId);
-
     setCombos(combos.map((c) => (c.id === comboId ? { ...c, selections: newSelections, status: comboStatus } : c)));
   };
 
@@ -355,6 +436,9 @@ export default function Home() {
   const formImpliedProb = form.odds ? impliedProbability(parseFloat(form.odds)) : 0;
   const formEdge = form.odds ? calculateEdge(formConfidenceLevel.probability, parseFloat(form.odds)) : null;
   const formVerdict = formEdge != null ? getVerdict(formEdge) : null;
+
+  // ── Progreso del checklist avanzado ──────────────────────────────────
+  const checklistProgress = Object.values(checklistForm.respuestas).filter(Boolean).length;
 
   if (loading) {
     return (
@@ -401,6 +485,9 @@ export default function Home() {
         </button>
         <button style={{ ...styles.tabBtn, ...(tab === "combinadas" ? styles.tabBtnActive : {}) }} onClick={() => { setTab("combinadas"); setShowForm(false); }}>
           <Layers size={13} /> Combinadas
+        </button>
+        <button style={{ ...styles.tabBtn, ...(tab === "checklist" ? styles.tabBtnActive : {}) }} onClick={() => { setTab("checklist"); setShowForm(false); }}>
+          <ClipboardList size={13} /> Checklist
         </button>
         <button style={{ ...styles.tabBtn, ...(tab === "analisis" ? styles.tabBtnActive : {}) }} onClick={() => { setTab("analisis"); setShowForm(false); }}>
           <Target size={13} /> Análisis
@@ -532,7 +619,6 @@ export default function Home() {
           <input type="date" value={comboForm.date} onChange={(e) => setComboForm({ ...comboForm, date: e.target.value })} style={styles.input} />
           {comboForm.selections.map((sel, idx) => {
             const selConfidence = CONFIDENCE_LEVELS.find((c) => c.id === sel.confidence) || CONFIDENCE_LEVELS[1];
-            const selImplied = sel.odds ? impliedProbability(parseFloat(sel.odds)) : 0;
             const selEdge = sel.odds ? calculateEdge(selConfidence.probability, parseFloat(sel.odds)) : null;
             const selVerdict = selEdge != null ? getVerdict(selEdge) : null;
             return (
@@ -551,7 +637,6 @@ export default function Home() {
                 {MARKETS.map((m) => <option key={m} value={m}>{m}</option>)}
               </select>
               <input type="number" step="0.01" placeholder="Cuota (ej: 1.65)" value={sel.odds} onChange={(e) => updateSelection(idx, "odds", e.target.value)} style={{ ...styles.inputSmall, marginTop: 7 }} />
-
               <select value={sel.biasPattern} onChange={(e) => updateSelection(idx, "biasPattern", e.target.value)} style={{ ...styles.inputSmall, marginTop: 7 }}>
                 {BIAS_PATTERNS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
               </select>
@@ -604,6 +689,18 @@ export default function Home() {
       </>
       )}
 
+      {tab === "checklist" && (
+        <ChecklistPanel
+          checklistForm={checklistForm}
+          setChecklistForm={setChecklistForm}
+          checklistProgress={checklistProgress}
+          onSave={saveChecklist}
+          onReset={resetChecklist}
+          onIrAApuesta={irACrearApuesta}
+          checklistsPendientes={checklistsPendientes}
+        />
+      )}
+
       {tab === "analisis" && (
         <PerformancePanel
           overallDecided={overallDecided}
@@ -618,6 +715,146 @@ export default function Home() {
       <div style={styles.footer}>
         Pídele a Claude en el chat que busque los resultados y aplícalos aquí con el botón ✓ de cada partido.
       </div>
+    </div>
+  );
+}
+
+// ── Checklist Panel ───────────────────────────────────────────────────────
+function ChecklistPanel({ checklistForm, setChecklistForm, checklistProgress, onSave, onReset, onIrAApuesta, checklistsPendientes }) {
+  const actualizarRespuesta = (id, valor) => {
+    setChecklistForm((prev) => ({
+      ...prev,
+      respuestas: { ...prev.respuestas, [id]: valor },
+    }));
+  };
+
+  if (checklistForm.guardado) {
+    return (
+      <div style={styles.listSection}>
+        <div style={{ ...styles.panelOverallCard, textAlign: "left" }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#3FA66B", marginBottom: 6 }}>✅ Checklist guardado</div>
+          <div style={{ fontSize: 12.5, color: "#C9C2B3", marginBottom: 4 }}>{checklistForm.match}</div>
+          <div style={{ fontSize: 11, color: "#76705F" }}>{checklistForm.competition} · {checklistForm.date}</div>
+          <div style={{ fontSize: 11, color: "#9A9488", marginTop: 8 }}>{checklistProgress} de 5 preguntas respondidas</div>
+        </div>
+        <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+          <button onClick={onIrAApuesta} style={{ ...styles.saveBtn, flex: 1.4 }}>
+            Crear apuesta con este análisis
+          </button>
+          <button onClick={onReset} style={{ ...styles.cancelBtn, flex: 1 }}>
+            Nuevo checklist
+          </button>
+        </div>
+        {checklistsPendientes.length > 0 && (
+          <div style={{ marginTop: 16 }}>
+            <div style={styles.panelSectionTitle}>Checklists recientes</div>
+            {checklistsPendientes.slice(0, 5).map((c) => (
+              <div key={c.id} style={{ ...styles.betCard, marginBottom: 8 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: "#F5F1E8" }}>{c.partido}</div>
+                <div style={{ fontSize: 11, color: "#76705F", marginTop: 2 }}>{c.competencia} · {c.fecha}</div>
+                <div style={{ fontSize: 11, color: "#9A9488", marginTop: 4 }}>
+                  {[c.pregunta_1, c.pregunta_2, c.pregunta_3, c.pregunta_4, c.pregunta_5].filter(Boolean).length} / 5 preguntas
+                  {c.apuesta_simple_id || c.seleccion_id ? " · Vinculado a apuesta ✓" : " · Sin apuesta vinculada"}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.listSection}>
+      <div style={styles.formCard}>
+        <div style={styles.formTitle}>Checklist de análisis avanzado</div>
+        <div style={{ fontSize: 11, color: "#9A9488", marginBottom: 12 }}>
+          Completa el análisis previo al partido. Si decides apostar, puedes crear la apuesta directamente desde aquí.
+        </div>
+
+        <label style={styles.formLabel}>Fecha del partido</label>
+        <input type="date" value={checklistForm.date}
+          onChange={(e) => setChecklistForm((p) => ({ ...p, date: e.target.value }))}
+          style={styles.input} />
+
+        <label style={styles.formLabel}>Competencia</label>
+        <select value={checklistForm.competition}
+          onChange={(e) => setChecklistForm((p) => ({ ...p, competition: e.target.value }))}
+          style={styles.input}>
+          {COMPETITIONS.map((c) => <option key={c} value={c}>{c}</option>)}
+        </select>
+
+        <label style={styles.formLabel}>Partido</label>
+        <input type="text" placeholder="Ej: España vs Marruecos"
+          value={checklistForm.match}
+          onChange={(e) => setChecklistForm((p) => ({ ...p, match: e.target.value }))}
+          style={styles.input} />
+
+        <div style={{ marginTop: 14, borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: 14 }}>
+          {ADVANCED_CHECKLIST.map((pregunta, idx) => (
+            <div key={pregunta.id} style={{ marginBottom: 16 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: "#D4A537", marginBottom: 3 }}>
+                Pregunta {idx + 1} · {pregunta.patron}
+              </div>
+              <div style={{ fontSize: 12.5, color: "#F5F1E8", fontWeight: 600, marginBottom: 3 }}>
+                {pregunta.pregunta}
+              </div>
+              <div style={{ fontSize: 11, color: "#9A9488", marginBottom: 8 }}>
+                {pregunta.descripcion}
+              </div>
+              {pregunta.opciones.map((opcion) => (
+                <button
+                  key={opcion.value}
+                  onClick={() => actualizarRespuesta(pregunta.id, opcion.value)}
+                  style={{
+                    display: "block", width: "100%", textAlign: "left",
+                    background: checklistForm.respuestas[pregunta.id] === opcion.value
+                      ? "rgba(212,165,55,0.15)" : "#14171B",
+                    border: checklistForm.respuestas[pregunta.id] === opcion.value
+                      ? "1px solid #D4A537" : "1px solid rgba(255,255,255,0.08)",
+                    color: checklistForm.respuestas[pregunta.id] === opcion.value ? "#D4A537" : "#C9C2B3",
+                    borderRadius: 8, padding: "8px 10px", fontSize: 12, marginBottom: 5,
+                    cursor: "pointer", fontFamily: "inherit",
+                  }}
+                >
+                  {opcion.label}
+                </button>
+              ))}
+            </div>
+          ))}
+        </div>
+
+        <div style={{ fontSize: 11, color: "#76705F", textAlign: "center", marginBottom: 12 }}>
+          {checklistProgress} de 5 preguntas respondidas
+        </div>
+
+        <div style={styles.formActions}>
+          <button style={styles.cancelBtn} onClick={onReset}>Limpiar</button>
+          <button
+            style={{ ...styles.saveBtn, flex: 1.4, opacity: !checklistForm.match.trim() ? 0.5 : 1 }}
+            onClick={() => onSave()}
+            disabled={!checklistForm.match.trim() || checklistForm.guardandoChecklist}
+          >
+            {checklistForm.guardandoChecklist ? "Guardando…" : "Guardar análisis"}
+          </button>
+        </div>
+      </div>
+
+      {checklistsPendientes.length > 0 && !checklistForm.guardado && (
+        <div style={{ marginTop: 8 }}>
+          <div style={styles.panelSectionTitle}>Checklists recientes</div>
+          {checklistsPendientes.slice(0, 3).map((c) => (
+            <div key={c.id} style={{ ...styles.betCard, marginBottom: 8 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: "#F5F1E8" }}>{c.partido}</div>
+              <div style={{ fontSize: 11, color: "#76705F", marginTop: 2 }}>{c.competencia} · {c.fecha}</div>
+              <div style={{ fontSize: 11, color: "#9A9488", marginTop: 4 }}>
+                {[c.pregunta_1, c.pregunta_2, c.pregunta_3, c.pregunta_4, c.pregunta_5].filter(Boolean).length} / 5 preguntas
+                {c.apuesta_simple_id || c.seleccion_id ? " · Vinculado ✓" : ""}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -704,7 +941,7 @@ function BetCard({ bet, onApplyResult, onDelete }) {
   const [editing, setEditing] = useState(false);
   const [home, setHome] = useState("");
   const [away, setAway] = useState("");
-  const [pendingStatus, setPendingStatus] = useState(null); // null hasta calcular
+  const [pendingStatus, setPendingStatus] = useState(null);
   const [reason, setReason] = useState("");
   const cfg = STATUS_CONFIG[bet.status] || STATUS_CONFIG[STATUS.PENDING];
   const pnl = bet.status === STATUS.WON ? bet.stakeAmount * bet.odds - bet.stakeAmount : bet.status === STATUS.LOST ? -bet.stakeAmount : 0;
@@ -898,8 +1135,8 @@ const styles = {
   bankrollValue: { fontSize: 17, fontWeight: 700, color: "#F5F1E8", background: "none", border: "none", cursor: "pointer", padding: 0, fontFamily: "inherit" },
   bankrollInput: { width: 110, background: "#1E2128", border: "1px solid rgba(212,165,55,0.4)", borderRadius: 7, padding: "6px 8px", color: "#F5F1E8", fontSize: 14 },
   bankrollConfirm: { background: "#D4A537", color: "#14171B", border: "none", borderRadius: 7, padding: "6px 10px", fontSize: 12, fontWeight: 700, cursor: "pointer" },
-  tabs: { display: "flex", gap: 8, padding: "14px 18px 0" },
-  tabBtn: { flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, background: "#1B1E24", border: "1px solid rgba(255,255,255,0.06)", color: "#9A9488", borderRadius: 10, padding: "9px", fontSize: 12.5, fontWeight: 600, cursor: "pointer" },
+  tabs: { display: "flex", gap: 6, padding: "14px 18px 0" },
+  tabBtn: { flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 4, background: "#1B1E24", border: "1px solid rgba(255,255,255,0.06)", color: "#9A9488", borderRadius: 10, padding: "8px 4px", fontSize: 11, fontWeight: 600, cursor: "pointer" },
   tabBtnActive: { background: "rgba(212,165,55,0.12)", border: "1px solid rgba(212,165,55,0.35)", color: "#D4A537" },
   kpiRow: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, padding: "14px 18px" },
   kpiCard: { background: "#1B1E24", borderRadius: 11, padding: "11px 10px", border: "1px solid rgba(255,255,255,0.05)" },
@@ -953,7 +1190,6 @@ const styles = {
   scoreCancelBtn: { flex: 1, background: "transparent", border: "1px solid rgba(255,255,255,0.12)", color: "#C9C2B3", borderRadius: 7, padding: "7px", fontSize: 11.5, fontWeight: 600, cursor: "pointer" },
   scoreApplyBtn: { flex: 1.6, background: "#D4A537", border: "none", color: "#14171B", borderRadius: 7, padding: "7px", fontSize: 11.5, fontWeight: 700, cursor: "pointer" },
   selEditBtn: { background: "rgba(212,165,55,0.12)", border: "none", color: "#D4A537", borderRadius: 6, width: 24, height: 24, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0 },
-
   protocolBox: { marginTop: 14, background: "rgba(212,165,55,0.05)", border: "1px solid rgba(212,165,55,0.18)", borderRadius: 10, padding: 12 },
   protocolTitle: { fontSize: 12.5, fontWeight: 700, color: "#D4A537", marginBottom: 4, letterSpacing: "0.02em" },
   protocolHint: { fontSize: 10.5, color: "#9A9488", marginTop: 5, lineHeight: 1.4 },
@@ -973,11 +1209,9 @@ const styles = {
   miniBtn: { flex: 1, background: "#14171B", border: "1px solid rgba(255,255,255,0.1)", color: "#C9C2B3", borderRadius: 7, padding: "7px", fontSize: 11.5, fontWeight: 600, cursor: "pointer" },
   miniBtnActive: { background: "rgba(63,166,107,0.15)", border: "1px solid #3FA66B", color: "#3FA66B" },
   miniBtnActiveNo: { background: "rgba(199,84,80,0.15)", border: "1px solid #C75450", color: "#C75450" },
-
   reasonBox: { background: "rgba(212,165,55,0.06)", border: "1px solid rgba(212,165,55,0.2)", borderRadius: 8, padding: 9, marginTop: 7 },
   reasonLabel: { fontSize: 10.5, color: "#9A9488", marginBottom: 6, display: "block" },
   reasonSelect: { width: "100%", background: "#14171B", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 7, padding: "7px 8px", color: "#F5F1E8", fontSize: 11.5, fontFamily: "inherit", boxSizing: "border-box" },
-
   panelOverallCard: { background: "rgba(212,165,55,0.08)", border: "1px solid rgba(212,165,55,0.2)", borderRadius: 12, padding: "16px", textAlign: "center", marginBottom: 8 },
   panelOverallLabel: { fontSize: 11.5, color: "#9A9488", fontWeight: 600, marginBottom: 4 },
   panelOverallValue: { fontSize: 32, fontWeight: 700, color: "#D4A537", lineHeight: 1 },
