@@ -9,10 +9,10 @@ import {
   MARKETS, COMPETITIONS, STAKE_OPTIONS, STATUS, CLP, todayISO,
   emptySelection, resolveMarket, BIAS_PATTERNS, CONFIDENCE_LEVELS,
   EDGE_THRESHOLD, impliedProbability, calculateEdge, getVerdict,
-  LOSS_REASONS, WIN_FACTORS, ADVANCED_CHECKLIST, emptyAdvancedChecklist,
+  LOSS_REASONS, WIN_FACTORS, ADVANCED_CHECKLIST, CHECKLIST_CIERRE,
+  emptyAdvancedChecklist,
 } from "../lib/betting";
 
-// ── Estado vacío para un bloque de análisis previo ───────────────────────
 const emptyAnalysisBlock = () => ({
   date: todayISO(),
   competition: COMPETITIONS[0],
@@ -50,15 +50,13 @@ export default function Home() {
     selections: [emptySelection(), emptySelection()],
   });
 
-  // ── Estado del Análisis Previo ────────────────────────────────────────
-  const [analisisTipo, setAnalisisTipo] = useState(null); // "simple" | "combinada" | null
+  const [analisisTipo, setAnalisisTipo] = useState(null);
   const [analisisSimple, setAnalisisSimple] = useState(emptyAnalysisBlock());
   const [analisisSimpleGuardado, setAnalisisSimpleGuardado] = useState(false);
   const [analisisCombinada, setAnalisisCombinada] = useState([emptyAnalysisBlock(), emptyAnalysisBlock()]);
   const [analisisCombinadaGuardado, setAnalisisCombinadaGuardado] = useState(false);
   const [guardandoAnalisis, setGuardandoAnalisis] = useState(false);
 
-  // ── Cargar datos desde Supabase al iniciar ───────────────────────────
   useEffect(() => { loadAll(); }, []);
 
   async function loadAll() {
@@ -101,7 +99,6 @@ export default function Home() {
     };
   }
 
-  // ── Estadísticas ──────────────────────────────────────────────────────
   const singleStats = bets.reduce((acc, b) => {
     if (b.status === STATUS.WON) { acc.won += 1; acc.netPL += b.stakeAmount * b.odds - b.stakeAmount; }
     else if (b.status === STATUS.LOST) { acc.lost += 1; acc.netPL -= b.stakeAmount; }
@@ -126,7 +123,6 @@ export default function Home() {
   const winRate = decided > 0 && activeStats ? (activeStats.won / decided) * 100 : 0;
   const roi = activeStats && activeStats.totalStaked > 0 ? (activeStats.netPL / activeStats.totalStaked) * 100 : 0;
 
-  // ── Panel de rendimiento ──────────────────────────────────────────────
   const allDecidedItems = [
     ...bets.filter((b) => b.status === STATUS.WON || b.status === STATUS.LOST)
       .map((b) => ({ market: b.market, competition: b.competition, stakePct: b.stakePct, status: b.status, razonResultado: b.razonResultado })),
@@ -163,7 +159,7 @@ export default function Home() {
   const overallWon = allDecidedItems.filter((i) => i.status === STATUS.WON).length;
   const overallWinRate = overallDecided > 0 ? (overallWon / overallDecided) * 100 : 0;
 
-  // ── Guardar análisis previo en Supabase ───────────────────────────────
+  // ── Guardar análisis previo ───────────────────────────────────────────
   const guardarAnalisisSimple = async () => {
     if (!analisisSimple.match.trim()) return;
     setGuardandoAnalisis(true);
@@ -171,10 +167,12 @@ export default function Home() {
       fecha: analisisSimple.date, competencia: analisisSimple.competition,
       partido: analisisSimple.match.trim(),
       pregunta_1: analisisSimple.respuestas.xg_vs_goles,
-      pregunta_2: analisisSimple.respuestas.brecha_cuotas,
-      pregunta_3: analisisSimple.respuestas.xg_concedido,
-      pregunta_4: analisisSimple.respuestas.racha_presion,
-      pregunta_5: analisisSimple.respuestas.forma_menos_favorito,
+      pregunta_2: analisisSimple.respuestas.xg_concedido,
+      pregunta_3: analisisSimple.respuestas.racha_ambos,
+      pregunta_4: analisisSimple.respuestas.forma_menos_favorito,
+      pregunta_5: analisisSimple.respuestas.valor_mercado,
+      pregunta_6: analisisSimple.respuestas.brecha_cuotas,
+      pregunta_cierre: analisisSimple.respuestas.partido_cerrado,
     });
     setAnalisisSimpleGuardado(true);
     setGuardandoAnalisis(false);
@@ -187,9 +185,13 @@ export default function Home() {
     for (const bloque of validos) {
       await supabase.from("checklist_analisis").insert({
         fecha: bloque.date, competencia: bloque.competition, partido: bloque.match.trim(),
-        pregunta_1: bloque.respuestas.xg_vs_goles, pregunta_2: bloque.respuestas.brecha_cuotas,
-        pregunta_3: bloque.respuestas.xg_concedido, pregunta_4: bloque.respuestas.racha_presion,
-        pregunta_5: bloque.respuestas.forma_menos_favorito,
+        pregunta_1: bloque.respuestas.xg_vs_goles,
+        pregunta_2: bloque.respuestas.xg_concedido,
+        pregunta_3: bloque.respuestas.racha_ambos,
+        pregunta_4: bloque.respuestas.forma_menos_favorito,
+        pregunta_5: bloque.respuestas.valor_mercado,
+        pregunta_6: bloque.respuestas.brecha_cuotas,
+        pregunta_cierre: bloque.respuestas.partido_cerrado,
       });
     }
     setAnalisisCombinadaGuardado(true);
@@ -217,7 +219,6 @@ export default function Home() {
         ...emptySelection(),
         competition: b.competition,
         match: b.match,
-        date: b.date,
       })),
     }));
     setTab("combinadas");
@@ -255,7 +256,7 @@ export default function Home() {
 
   const bloquesValidos = analisisCombinada.filter((b) => b.match.trim()).length;
 
-  // ── Crear apuesta simple ─────────────────────────────────────────────
+  // ── Crear apuesta simple — ahora con checklist_forma y checklist_valor ─
   const addBet = async () => {
     if (!form.match.trim() || !form.odds) return;
     setSaving(true);
@@ -267,7 +268,9 @@ export default function Home() {
       mercado: form.market, cuota: parseFloat(form.odds), stake_pct: form.stake,
       monto_apostado: stakeAmount, estado: STATUS.PENDING,
       patron_sesgo: form.biasPattern, nivel_confianza: form.confidence,
-      edge_calculado: edge, checklist_forma: form.checklistForma, checklist_valor: form.checklistValor,
+      edge_calculado: edge,
+      checklist_forma: form.checklistForma,   // ← ahora se guarda
+      checklist_valor: form.checklistValor,   // ← ahora se guarda
     }).select().single();
     if (!error && data) {
       setBets([mapBetFromDb(data), ...bets]);
@@ -277,7 +280,7 @@ export default function Home() {
     setSaving(false);
   };
 
-  // ── Crear combinada ──────────────────────────────────────────────────
+  // ── Crear combinada — ahora con checklist_forma y checklist_valor ──────
   const addCombo = async () => {
     const validSelections = comboForm.selections.filter((s) => s.match.trim() && s.odds);
     if (validSelections.length < 2) return;
@@ -294,7 +297,10 @@ export default function Home() {
         combinada_id: comboData.id, competencia: s.competition, partido: s.match.trim(),
         mercado: s.market, cuota: parseFloat(s.odds), estado: STATUS.PENDING, orden: idx,
         patron_sesgo: s.biasPattern || BIAS_PATTERNS[BIAS_PATTERNS.length - 1].id,
-        nivel_confianza: s.confidence || CONFIDENCE_LEVELS[1].id, edge_calculado: edge,
+        nivel_confianza: s.confidence || CONFIDENCE_LEVELS[1].id,
+        edge_calculado: edge,
+        checklist_forma: s.checklistForma || null,   // ← ahora se guarda
+        checklist_valor: s.checklistValor || null,   // ← ahora se guarda
       };
     });
     const { data: selData } = await supabase.from("combinada_selecciones").insert(selectionsToInsert).select();
@@ -314,11 +320,9 @@ export default function Home() {
     setSaving(false);
   };
 
-  // ── Eliminar ──────────────────────────────────────────────────────────
   const deleteBet = async (id) => { await supabase.from("apuestas_simples").delete().eq("id", id); setBets(bets.filter((b) => b.id !== id)); };
   const deleteCombo = async (id) => { await supabase.from("apuestas_combinadas").delete().eq("id", id); setCombos(combos.filter((c) => c.id !== id)); };
 
-  // ── Aplicar resultado a apuesta simple ──────────────────────────────
   const applyResultToBet = async (betId, homeGoals, awayGoals, reason) => {
     const bet = bets.find((b) => b.id === betId);
     if (!bet) return;
@@ -328,7 +332,6 @@ export default function Home() {
     setBets(bets.map((b) => (b.id === betId ? { ...b, status: newStatus, result: { homeGoals, awayGoals }, razonResultado: reason } : b)));
   };
 
-  // ── Aplicar resultado a selección de combinada ───────────────────────
   const applyResultToSelection = async (comboId, selId, homeGoals, awayGoals, reason) => {
     const combo = combos.find((c) => c.id === comboId);
     if (!combo) return;
@@ -338,17 +341,16 @@ export default function Home() {
     const newSelStatus = resolved || STATUS.PENDING;
     await supabase.from("combinada_selecciones").update({ estado: newSelStatus, goles_local: homeGoals, goles_visitante: awayGoals, razon_resultado: reason }).eq("id", selId);
     const newSelections = combo.selections.map((s) => s.id === selId ? { ...s, status: newSelStatus, result: { homeGoals, awayGoals }, razonResultado: reason } : s);
-    const allDecided = newSelections.every((s) => s.status !== STATUS.PENDING);
+    const allDecidedSels = newSelections.every((s) => s.status !== STATUS.PENDING);
     const anyLost = newSelections.some((s) => s.status === STATUS.LOST);
     const allWonOrVoid = newSelections.every((s) => s.status === STATUS.WON || s.status === STATUS.VOID);
     let comboStatus = STATUS.PENDING;
     if (anyLost) comboStatus = STATUS.LOST;
-    else if (allDecided && allWonOrVoid) comboStatus = STATUS.WON;
+    else if (allDecidedSels && allWonOrVoid) comboStatus = STATUS.WON;
     await supabase.from("apuestas_combinadas").update({ estado: comboStatus }).eq("id", comboId);
     setCombos(combos.map((c) => (c.id === comboId ? { ...c, selections: newSelections, status: comboStatus } : c)));
   };
 
-  // ── Banca ─────────────────────────────────────────────────────────────
   const startEditBankroll = () => { setBankrollInput(String(bankroll)); setEditingBankroll(true); };
   const confirmBankroll = async () => {
     const val = parseFloat(bankrollInput.replace(/[^\d.]/g, ""));
@@ -356,7 +358,6 @@ export default function Home() {
     setEditingBankroll(false);
   };
 
-  // ── Combo form helpers ───────────────────────────────────────────────
   const updateSelection = (idx, field, value) => {
     const sels = [...comboForm.selections];
     sels[idx] = { ...sels[idx], [field]: value };
@@ -366,7 +367,6 @@ export default function Home() {
   const removeSelection = (idx) => { if (comboForm.selections.length <= 2) return; setComboForm({ ...comboForm, selections: comboForm.selections.filter((_, i) => i !== idx) }); };
   const comboPreviewOdds = comboForm.selections.filter((s) => s.odds).reduce((p, s) => p * parseFloat(s.odds || 1), 1);
 
-  // ── Cálculo en vivo del Edge ─────────────────────────────────────────
   const formConfidenceLevel = CONFIDENCE_LEVELS.find((c) => c.id === form.confidence);
   const formImpliedProb = form.odds ? impliedProbability(parseFloat(form.odds)) : 0;
   const formEdge = form.odds ? calculateEdge(formConfidenceLevel.probability, parseFloat(form.odds)) : null;
@@ -638,11 +638,16 @@ export default function Home() {
   );
 }
 
-// ── Bloque de análisis (partido + 5 preguntas) ────────────────────────────
-function BloqueAnalisis({ bloque, onChange, titulo }) {
+// ── Bloque de análisis — 6 preguntas reordenadas + pregunta de cierre ─────
+function BloqueAnalisis({ bloque, onChange }) {
+  const respuestasCompletadas = Object.entries(bloque.respuestas)
+    .filter(([key]) => key !== "partido_cerrado")
+    .filter(([, v]) => v !== null).length;
+
+  const alertaPartidoCerrado = bloque.respuestas.partido_cerrado === "si_cerrado";
+
   return (
     <div style={{ marginBottom: 16 }}>
-      {titulo && <div style={{ fontSize: 12, fontWeight: 700, color: "#D4A537", marginBottom: 8 }}>{titulo}</div>}
       <label style={styles.formLabel}>Fecha</label>
       <input type="date" value={bloque.date} onChange={(e) => onChange("date", e.target.value)} style={styles.input} />
       <label style={styles.formLabel}>Competencia</label>
@@ -653,9 +658,10 @@ function BloqueAnalisis({ bloque, onChange, titulo }) {
       <input type="text" placeholder="Ej: España vs Marruecos" value={bloque.match} onChange={(e) => onChange("match", e.target.value)} style={styles.input} />
 
       <div style={{ marginTop: 14, borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: 14 }}>
+        {/* 6 preguntas principales */}
         {ADVANCED_CHECKLIST.map((pregunta, idx) => (
           <div key={pregunta.id} style={{ marginBottom: 14 }}>
-            <div style={{ fontSize: 10.5, fontWeight: 700, color: "#D4A537", marginBottom: 2 }}>
+            <div style={{ fontSize: 10.5, fontWeight: 700, color: pregunta.esDatoReal ? "#D4A537" : "#9A9488", marginBottom: 2 }}>
               P{idx + 1} · {pregunta.patron}
             </div>
             <div style={{ fontSize: 12, color: "#F5F1E8", fontWeight: 600, marginBottom: 2 }}>{pregunta.pregunta}</div>
@@ -675,6 +681,39 @@ function BloqueAnalisis({ bloque, onChange, titulo }) {
             ))}
           </div>
         ))}
+
+        {/* Pregunta de cierre */}
+        <div style={{ marginTop: 16, padding: 12, background: "rgba(212,165,55,0.06)", border: "1px solid rgba(212,165,55,0.2)", borderRadius: 10 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#D4A537", marginBottom: 4 }}>
+            CIERRE · Basado en tus {respuestasCompletadas}/6 respuestas anteriores
+          </div>
+          <div style={{ fontSize: 12, color: "#F5F1E8", fontWeight: 600, marginBottom: 3 }}>{CHECKLIST_CIERRE.pregunta}</div>
+          <div style={{ fontSize: 10.5, color: "#9A9488", marginBottom: 8 }}>{CHECKLIST_CIERRE.descripcion}</div>
+          {CHECKLIST_CIERRE.opciones.map((opcion) => (
+            <button key={opcion.value} onClick={() => onChange("respuesta", { id: "partido_cerrado", val: opcion.value })}
+              style={{
+                display: "block", width: "100%", textAlign: "left",
+                background: bloque.respuestas.partido_cerrado === opcion.value
+                  ? (opcion.alerta ? "rgba(199,84,80,0.15)" : "rgba(212,165,55,0.15)")
+                  : "#14171B",
+                border: bloque.respuestas.partido_cerrado === opcion.value
+                  ? (opcion.alerta ? "1px solid #C75450" : "1px solid #D4A537")
+                  : "1px solid rgba(255,255,255,0.08)",
+                color: bloque.respuestas.partido_cerrado === opcion.value
+                  ? (opcion.alerta ? "#C75450" : "#D4A537")
+                  : "#C9C2B3",
+                borderRadius: 8, padding: "7px 10px", fontSize: 11.5, marginBottom: 4,
+                cursor: "pointer", fontFamily: "inherit",
+              }}>
+              {opcion.label}
+            </button>
+          ))}
+          {alertaPartidoCerrado && (
+            <div style={{ marginTop: 8, padding: "8px 10px", background: "rgba(199,84,80,0.1)", border: "1px solid rgba(199,84,80,0.3)", borderRadius: 8, fontSize: 11, color: "#C75450", lineHeight: 1.4 }}>
+              ⚠️ Antes de apostar a resultado directo, busca la cuota de <strong>Menos de 2.5 goles</strong> y compara el Edge con tu mercado original.
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -690,7 +729,6 @@ function AnalisisPrevioPanel({
   onIrApuestaSimple, onIrCombinada, onReset,
   onUpdateCombinada, onAddBloque, onRemoveBloque,
 }) {
-  // Pantalla inicial: elegir tipo
   if (!analisisTipo) {
     return (
       <div style={styles.listSection}>
@@ -714,7 +752,6 @@ function AnalisisPrevioPanel({
     );
   }
 
-  // Análisis guardado (simple)
   if (analisisTipo === "simple" && analisisSimpleGuardado) {
     return (
       <div style={styles.listSection}>
@@ -723,8 +760,13 @@ function AnalisisPrevioPanel({
           <div style={{ fontSize: 13, color: "#F5F1E8", fontWeight: 600 }}>{analisisSimple.match}</div>
           <div style={{ fontSize: 11, color: "#76705F", marginTop: 2 }}>{analisisSimple.competition} · {analisisSimple.date}</div>
           <div style={{ fontSize: 11, color: "#9A9488", marginTop: 6 }}>
-            {Object.values(analisisSimple.respuestas).filter(Boolean).length} de 5 preguntas respondidas
+            {Object.entries(analisisSimple.respuestas).filter(([k]) => k !== "partido_cerrado").filter(([, v]) => v).length} de 6 preguntas respondidas
           </div>
+          {analisisSimple.respuestas.partido_cerrado === "si_cerrado" && (
+            <div style={{ marginTop: 8, padding: "7px 10px", background: "rgba(199,84,80,0.1)", border: "1px solid rgba(199,84,80,0.3)", borderRadius: 8, fontSize: 11, color: "#C75450" }}>
+              ⚠️ Partido cerrado detectado — evalúa Menos de 2.5 goles antes de apostar a resultado directo
+            </div>
+          )}
         </div>
         <button onClick={onIrApuestaSimple} style={{ ...styles.saveBtn, width: "100%", marginTop: 4 }}>
           Crear apuesta simple con este análisis →
@@ -736,7 +778,6 @@ function AnalisisPrevioPanel({
     );
   }
 
-  // Análisis guardado (combinada)
   if (analisisTipo === "combinada" && analisisCombinadaGuardado) {
     return (
       <div style={styles.listSection}>
@@ -746,6 +787,9 @@ function AnalisisPrevioPanel({
             <div key={idx} style={{ marginBottom: 6 }}>
               <div style={{ fontSize: 12.5, color: "#F5F1E8", fontWeight: 600 }}>Partido {idx + 1}: {b.match}</div>
               <div style={{ fontSize: 11, color: "#76705F" }}>{b.competition} · {b.date}</div>
+              {b.respuestas.partido_cerrado === "si_cerrado" && (
+                <div style={{ fontSize: 10.5, color: "#C75450", marginTop: 2 }}>⚠️ Partido cerrado — evalúa Menos de 2.5 goles</div>
+              )}
             </div>
           ))}
         </div>
@@ -759,7 +803,6 @@ function AnalisisPrevioPanel({
     );
   }
 
-  // Formulario simple
   if (analisisTipo === "simple") {
     return (
       <div style={styles.listSection}>
@@ -779,11 +822,9 @@ function AnalisisPrevioPanel({
             }}
           />
           <div style={{ fontSize: 11, color: "#76705F", textAlign: "center", marginBottom: 12 }}>
-            {Object.values(analisisSimple.respuestas).filter(Boolean).length} de 5 preguntas respondidas
+            {Object.entries(analisisSimple.respuestas).filter(([k]) => k !== "partido_cerrado").filter(([, v]) => v).length} de 6 preguntas respondidas
           </div>
-          <button
-            onClick={onGuardarSimple}
-            disabled={!analisisSimple.match.trim() || guardandoAnalisis}
+          <button onClick={onGuardarSimple} disabled={!analisisSimple.match.trim() || guardandoAnalisis}
             style={{ ...styles.saveBtn, width: "100%", opacity: !analisisSimple.match.trim() ? 0.5 : 1 }}>
             {guardandoAnalisis ? "Guardando…" : "Guardar análisis"}
           </button>
@@ -792,7 +833,6 @@ function AnalisisPrevioPanel({
     );
   }
 
-  // Formulario combinada
   if (analisisTipo === "combinada") {
     return (
       <div style={styles.listSection}>
@@ -804,7 +844,6 @@ function AnalisisPrevioPanel({
           <div style={{ fontSize: 11, color: "#9A9488", marginBottom: 14 }}>
             Analiza cada partido por separado. Con 2 o 3 partidos listos podrás crear la combinada.
           </div>
-
           {analisisCombinada.map((bloque, idx) => (
             <div key={idx} style={{ ...styles.selectionBlock, marginBottom: 12 }}>
               <div style={styles.selectionHeader}>
@@ -813,27 +852,19 @@ function AnalisisPrevioPanel({
                   <button onClick={() => onRemoveBloque(idx)} style={styles.removeSelBtn}><X size={13} /></button>
                 )}
               </div>
-              <BloqueAnalisis
-                bloque={bloque}
-                onChange={(field, value) => onUpdateCombinada(idx, field, value)}
-              />
+              <BloqueAnalisis bloque={bloque} onChange={(field, value) => onUpdateCombinada(idx, field, value)} />
             </div>
           ))}
-
           {analisisCombinada.length < 3 && (
             <button onClick={onAddBloque} style={styles.addSelectionBtn}>
               <Plus size={13} /> Añadir Partido {String.fromCharCode(65 + analisisCombinada.length)}
             </button>
           )}
-
           <div style={{ fontSize: 11, color: bloquesValidos >= 2 ? "#3FA66B" : "#76705F", textAlign: "center", margin: "12px 0" }}>
             {bloquesValidos} de {analisisCombinada.length} partidos con nombre completo
             {bloquesValidos >= 2 ? " · Listo para crear combinada" : " · Necesitas al menos 2"}
           </div>
-
-          <button
-            onClick={onGuardarCombinada}
-            disabled={bloquesValidos < 2 || guardandoAnalisis}
+          <button onClick={onGuardarCombinada} disabled={bloquesValidos < 2 || guardandoAnalisis}
             style={{ ...styles.saveBtn, width: "100%", opacity: bloquesValidos < 2 ? 0.5 : 1 }}>
             {guardandoAnalisis ? "Guardando…" : "Guardar análisis y crear combinada"}
           </button>
