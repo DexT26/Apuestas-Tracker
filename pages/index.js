@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 import {
   Plus, Trash2, TrendingUp, TrendingDown, Wallet, Target,
   AlertCircle, CheckCircle2, XCircle, Clock, Loader2, Layers, Circle, X,
-  ClipboardList, BarChart2,
+  ClipboardList, BarChart2, RotateCcw,
 } from "lucide-react";
 import { supabase } from "../lib/supabaseClient";
 import {
@@ -10,7 +10,7 @@ import {
   emptySelection, resolveMarket, BIAS_PATTERNS, CONFIDENCE_LEVELS,
   EDGE_THRESHOLD, impliedProbability, calculateEdge, getVerdict,
   LOSS_REASONS, WIN_FACTORS, ADVANCED_CHECKLIST, CHECKLIST_CIERRE,
-  emptyAdvancedChecklist,
+  emptyAdvancedChecklist, calcularMercadoRecomendado,
 } from "../lib/betting";
 
 const emptyAnalysisBlock = () => ({
@@ -30,6 +30,8 @@ export default function Home() {
   const [editingBankroll, setEditingBankroll] = useState(false);
   const [bankrollInput, setBankrollInput] = useState("");
   const [saving, setSaving] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
 
   const [form, setForm] = useState({
     date: todayISO(),
@@ -159,6 +161,21 @@ export default function Home() {
   const overallWon = allDecidedItems.filter((i) => i.status === STATUS.WON).length;
   const overallWinRate = overallDecided > 0 ? (overallWon / overallDecided) * 100 : 0;
 
+  // ── Reinicio total ────────────────────────────────────────────────────
+  const resetTotal = async () => {
+    setResetting(true);
+    await supabase.from("checklist_analisis").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+    await supabase.from("combinada_selecciones").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+    await supabase.from("apuestas_combinadas").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+    await supabase.from("apuestas_simples").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+    await supabase.from("banca").update({ monto: 500000 }).eq("id", 1);
+    setBets([]);
+    setCombos([]);
+    setBankroll(500000);
+    setConfirmReset(false);
+    setResetting(false);
+  };
+
   // ── Guardar análisis previo ───────────────────────────────────────────
   const guardarAnalisisSimple = async () => {
     if (!analisisSimple.match.trim()) return;
@@ -166,13 +183,12 @@ export default function Home() {
     await supabase.from("checklist_analisis").insert({
       fecha: analisisSimple.date, competencia: analisisSimple.competition,
       partido: analisisSimple.match.trim(),
-      pregunta_1: analisisSimple.respuestas.xg_vs_goles,
-      pregunta_2: analisisSimple.respuestas.xg_concedido,
-      pregunta_3: analisisSimple.respuestas.racha_ambos,
-      pregunta_4: analisisSimple.respuestas.forma_menos_favorito,
-      pregunta_5: analisisSimple.respuestas.valor_mercado,
-      pregunta_6: analisisSimple.respuestas.brecha_cuotas,
-      pregunta_cierre: analisisSimple.respuestas.partido_cerrado,
+      pregunta_1: analisisSimple.respuestas.como_genera_goles,
+      pregunta_2: analisisSimple.respuestas.xg_conversion,
+      pregunta_3: analisisSimple.respuestas.solidez_defensiva,
+      pregunta_4: analisisSimple.respuestas.urgencia_puntos,
+      pregunta_5: analisisSimple.respuestas.estilo_defensivo_rival,
+      pregunta_cierre: calcularMercadoRecomendado(analisisSimple.respuestas).tipo,
     });
     setAnalisisSimpleGuardado(true);
     setGuardandoAnalisis(false);
@@ -185,13 +201,12 @@ export default function Home() {
     for (const bloque of validos) {
       await supabase.from("checklist_analisis").insert({
         fecha: bloque.date, competencia: bloque.competition, partido: bloque.match.trim(),
-        pregunta_1: bloque.respuestas.xg_vs_goles,
-        pregunta_2: bloque.respuestas.xg_concedido,
-        pregunta_3: bloque.respuestas.racha_ambos,
-        pregunta_4: bloque.respuestas.forma_menos_favorito,
-        pregunta_5: bloque.respuestas.valor_mercado,
-        pregunta_6: bloque.respuestas.brecha_cuotas,
-        pregunta_cierre: bloque.respuestas.partido_cerrado,
+        pregunta_1: bloque.respuestas.como_genera_goles,
+        pregunta_2: bloque.respuestas.xg_conversion,
+        pregunta_3: bloque.respuestas.solidez_defensiva,
+        pregunta_4: bloque.respuestas.urgencia_puntos,
+        pregunta_5: bloque.respuestas.estilo_defensivo_rival,
+        pregunta_cierre: calcularMercadoRecomendado(bloque.respuestas).tipo,
       });
     }
     setAnalisisCombinadaGuardado(true);
@@ -256,7 +271,6 @@ export default function Home() {
 
   const bloquesValidos = analisisCombinada.filter((b) => b.match.trim()).length;
 
-  // ── Crear apuesta simple — ahora con checklist_forma y checklist_valor ─
   const addBet = async () => {
     if (!form.match.trim() || !form.odds) return;
     setSaving(true);
@@ -269,8 +283,8 @@ export default function Home() {
       monto_apostado: stakeAmount, estado: STATUS.PENDING,
       patron_sesgo: form.biasPattern, nivel_confianza: form.confidence,
       edge_calculado: edge,
-      checklist_forma: form.checklistForma,   // ← ahora se guarda
-      checklist_valor: form.checklistValor,   // ← ahora se guarda
+      checklist_forma: form.checklistForma,
+      checklist_valor: form.checklistValor,
     }).select().single();
     if (!error && data) {
       setBets([mapBetFromDb(data), ...bets]);
@@ -280,7 +294,6 @@ export default function Home() {
     setSaving(false);
   };
 
-  // ── Crear combinada — ahora con checklist_forma y checklist_valor ──────
   const addCombo = async () => {
     const validSelections = comboForm.selections.filter((s) => s.match.trim() && s.odds);
     if (validSelections.length < 2) return;
@@ -299,8 +312,8 @@ export default function Home() {
         patron_sesgo: s.biasPattern || BIAS_PATTERNS[BIAS_PATTERNS.length - 1].id,
         nivel_confianza: s.confidence || CONFIDENCE_LEVELS[1].id,
         edge_calculado: edge,
-        checklist_forma: s.checklistForma || null,   // ← ahora se guarda
-        checklist_valor: s.checklistValor || null,   // ← ahora se guarda
+        checklist_forma: s.checklistForma || null,
+        checklist_valor: s.checklistValor || null,
       };
     });
     const { data: selData } = await supabase.from("combinada_selecciones").insert(selectionsToInsert).select();
@@ -628,6 +641,10 @@ export default function Home() {
           byLeague={byLeague}
           byStake={byStake}
           byLossReason={byLossReason}
+          confirmReset={confirmReset}
+          setConfirmReset={setConfirmReset}
+          resetting={resetting}
+          onReset={resetTotal}
         />
       )}
 
@@ -638,13 +655,14 @@ export default function Home() {
   );
 }
 
-// ── Bloque de análisis — 6 preguntas reordenadas + pregunta de cierre ─────
+// ── Bloque de análisis — 5 preguntas rediseñadas + cierre con recomendación ──
 function BloqueAnalisis({ bloque, onChange }) {
-  const respuestasCompletadas = Object.entries(bloque.respuestas)
-    .filter(([key]) => key !== "partido_cerrado")
-    .filter(([, v]) => v !== null).length;
+  const recomendacion = calcularMercadoRecomendado(bloque.respuestas);
+  const respuestasCompletadas = Object.values(bloque.respuestas).filter(Boolean).length;
 
-  const alertaPartidoCerrado = bloque.respuestas.partido_cerrado === "si_cerrado";
+  const colorRecomendacion = recomendacion.tipo === "over" ? "#3FA66B"
+    : recomendacion.tipo === "under" ? "#D4A537"
+    : "#C75450";
 
   return (
     <div style={{ marginBottom: 16 }}>
@@ -658,21 +676,31 @@ function BloqueAnalisis({ bloque, onChange }) {
       <input type="text" placeholder="Ej: España vs Marruecos" value={bloque.match} onChange={(e) => onChange("match", e.target.value)} style={styles.input} />
 
       <div style={{ marginTop: 14, borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: 14 }}>
-        {/* 6 preguntas principales */}
         {ADVANCED_CHECKLIST.map((pregunta, idx) => (
           <div key={pregunta.id} style={{ marginBottom: 14 }}>
-            <div style={{ fontSize: 10.5, fontWeight: 700, color: pregunta.esDatoReal ? "#D4A537" : "#9A9488", marginBottom: 2 }}>
-              P{idx + 1} · {pregunta.patron}
+            <div style={{ fontSize: 10.5, fontWeight: 700, color: "#D4A537", marginBottom: 2 }}>
+              P{idx + 1}
             </div>
             <div style={{ fontSize: 12, color: "#F5F1E8", fontWeight: 600, marginBottom: 2 }}>{pregunta.pregunta}</div>
-            <div style={{ fontSize: 10.5, color: "#9A9488", marginBottom: 6 }}>{pregunta.descripcion}</div>
+            <div style={{ fontSize: 10.5, color: "#9A9488", marginBottom: 4 }}>{pregunta.descripcion}</div>
+            {pregunta.nota && (
+              <div style={{ fontSize: 10, color: "#76705F", background: "rgba(255,255,255,0.03)", borderRadius: 6, padding: "5px 8px", marginBottom: 6, lineHeight: 1.4 }}>
+                {pregunta.nota}
+              </div>
+            )}
             {pregunta.opciones.map((opcion) => (
               <button key={opcion.value} onClick={() => onChange("respuesta", { id: pregunta.id, val: opcion.value })}
                 style={{
                   display: "block", width: "100%", textAlign: "left",
-                  background: bloque.respuestas[pregunta.id] === opcion.value ? "rgba(212,165,55,0.15)" : "#14171B",
-                  border: bloque.respuestas[pregunta.id] === opcion.value ? "1px solid #D4A537" : "1px solid rgba(255,255,255,0.08)",
-                  color: bloque.respuestas[pregunta.id] === opcion.value ? "#D4A537" : "#C9C2B3",
+                  background: bloque.respuestas[pregunta.id] === opcion.value
+                    ? (opcion.mercado === "over" ? "rgba(63,166,107,0.15)" : opcion.mercado === "under" ? "rgba(212,165,55,0.15)" : "rgba(154,148,136,0.15)")
+                    : "#14171B",
+                  border: bloque.respuestas[pregunta.id] === opcion.value
+                    ? (opcion.mercado === "over" ? "1px solid #3FA66B" : opcion.mercado === "under" ? "1px solid #D4A537" : "1px solid #9A9488")
+                    : "1px solid rgba(255,255,255,0.08)",
+                  color: bloque.respuestas[pregunta.id] === opcion.value
+                    ? (opcion.mercado === "over" ? "#3FA66B" : opcion.mercado === "under" ? "#D4A537" : "#9A9488")
+                    : "#C9C2B3",
                   borderRadius: 8, padding: "7px 10px", fontSize: 11.5, marginBottom: 4,
                   cursor: "pointer", fontFamily: "inherit",
                 }}>
@@ -682,37 +710,45 @@ function BloqueAnalisis({ bloque, onChange }) {
           </div>
         ))}
 
-        {/* Pregunta de cierre */}
-        <div style={{ marginTop: 16, padding: 12, background: "rgba(212,165,55,0.06)", border: "1px solid rgba(212,165,55,0.2)", borderRadius: 10 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: "#D4A537", marginBottom: 4 }}>
-            CIERRE · Basado en tus {respuestasCompletadas}/6 respuestas anteriores
+        {/* Pregunta de cierre con recomendación automática */}
+        <div style={{ marginTop: 16, padding: 12, background: "rgba(255,255,255,0.03)", border: `1px solid ${colorRecomendacion}40`, borderRadius: 10 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: colorRecomendacion, marginBottom: 4 }}>
+            CIERRE · {respuestasCompletadas}/5 preguntas respondidas
           </div>
-          <div style={{ fontSize: 12, color: "#F5F1E8", fontWeight: 600, marginBottom: 3 }}>{CHECKLIST_CIERRE.pregunta}</div>
-          <div style={{ fontSize: 10.5, color: "#9A9488", marginBottom: 8 }}>{CHECKLIST_CIERRE.descripcion}</div>
-          {CHECKLIST_CIERRE.opciones.map((opcion) => (
-            <button key={opcion.value} onClick={() => onChange("respuesta", { id: "partido_cerrado", val: opcion.value })}
-              style={{
-                display: "block", width: "100%", textAlign: "left",
-                background: bloque.respuestas.partido_cerrado === opcion.value
-                  ? (opcion.alerta ? "rgba(199,84,80,0.15)" : "rgba(212,165,55,0.15)")
-                  : "#14171B",
-                border: bloque.respuestas.partido_cerrado === opcion.value
-                  ? (opcion.alerta ? "1px solid #C75450" : "1px solid #D4A537")
-                  : "1px solid rgba(255,255,255,0.08)",
-                color: bloque.respuestas.partido_cerrado === opcion.value
-                  ? (opcion.alerta ? "#C75450" : "#D4A537")
-                  : "#C9C2B3",
-                borderRadius: 8, padding: "7px 10px", fontSize: 11.5, marginBottom: 4,
-                cursor: "pointer", fontFamily: "inherit",
-              }}>
-              {opcion.label}
-            </button>
-          ))}
-          {alertaPartidoCerrado && (
-            <div style={{ marginTop: 8, padding: "8px 10px", background: "rgba(199,84,80,0.1)", border: "1px solid rgba(199,84,80,0.3)", borderRadius: 8, fontSize: 11, color: "#C75450", lineHeight: 1.4 }}>
-              ⚠️ Antes de apostar a resultado directo, busca la cuota de <strong>Menos de 2.5 goles</strong> y compara el Edge con tu mercado original.
+          <div style={{ fontSize: 12, color: "#F5F1E8", fontWeight: 600, marginBottom: 6 }}>
+            {CHECKLIST_CIERRE.pregunta}
+          </div>
+          <div style={{ fontSize: 11, color: "#9A9488", marginBottom: 10 }}>
+            {CHECKLIST_CIERRE.descripcion}
+          </div>
+
+          {/* Conteo de señales */}
+          <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+            <div style={{ flex: 1, background: "rgba(63,166,107,0.1)", border: "1px solid rgba(63,166,107,0.3)", borderRadius: 8, padding: "7px 10px", textAlign: "center" }}>
+              <div style={{ fontSize: 18, fontWeight: 700, color: "#3FA66B" }}>{recomendacion.señalesOver}</div>
+              <div style={{ fontSize: 10, color: "#9A9488" }}>señales Over</div>
             </div>
-          )}
+            <div style={{ flex: 1, background: "rgba(212,165,55,0.1)", border: "1px solid rgba(212,165,55,0.3)", borderRadius: 8, padding: "7px 10px", textAlign: "center" }}>
+              <div style={{ fontSize: 18, fontWeight: 700, color: "#D4A537" }}>{recomendacion.señalesUnder}</div>
+              <div style={{ fontSize: 10, color: "#9A9488" }}>señales Under</div>
+            </div>
+          </div>
+
+          {/* Recomendación final */}
+          <div style={{
+            padding: "10px 12px", borderRadius: 8, textAlign: "center", fontWeight: 700, fontSize: 12.5,
+            background: recomendacion.tipo === "over" ? "rgba(63,166,107,0.15)"
+              : recomendacion.tipo === "under" ? "rgba(212,165,55,0.15)"
+              : "rgba(199,84,80,0.15)",
+            color: colorRecomendacion,
+            border: `1px solid ${colorRecomendacion}50`,
+          }}>
+            {recomendacion.tipo === "over" && "⬆️ "}
+            {recomendacion.tipo === "under" && "⬇️ "}
+            {recomendacion.tipo === "pasar" && "⚠️ "}
+            {recomendacion.tipo === "mixto" && "🔄 "}
+            {recomendacion.mercado}
+          </div>
         </div>
       </div>
     </div>
@@ -729,6 +765,8 @@ function AnalisisPrevioPanel({
   onIrApuestaSimple, onIrCombinada, onReset,
   onUpdateCombinada, onAddBloque, onRemoveBloque,
 }) {
+  const recomendacionSimple = calcularMercadoRecomendado(analisisSimple.respuestas);
+
   if (!analisisTipo) {
     return (
       <div style={styles.listSection}>
@@ -753,20 +791,16 @@ function AnalisisPrevioPanel({
   }
 
   if (analisisTipo === "simple" && analisisSimpleGuardado) {
+    const colorRec = recomendacionSimple.tipo === "over" ? "#3FA66B" : recomendacionSimple.tipo === "under" ? "#D4A537" : "#C75450";
     return (
       <div style={styles.listSection}>
         <div style={{ ...styles.panelOverallCard, textAlign: "left" }}>
           <div style={{ fontSize: 13, fontWeight: 700, color: "#3FA66B", marginBottom: 6 }}>✅ Análisis guardado</div>
           <div style={{ fontSize: 13, color: "#F5F1E8", fontWeight: 600 }}>{analisisSimple.match}</div>
           <div style={{ fontSize: 11, color: "#76705F", marginTop: 2 }}>{analisisSimple.competition} · {analisisSimple.date}</div>
-          <div style={{ fontSize: 11, color: "#9A9488", marginTop: 6 }}>
-            {Object.entries(analisisSimple.respuestas).filter(([k]) => k !== "partido_cerrado").filter(([, v]) => v).length} de 6 preguntas respondidas
+          <div style={{ marginTop: 10, padding: "8px 10px", background: `${colorRec}20`, border: `1px solid ${colorRec}50`, borderRadius: 8, fontSize: 12, fontWeight: 700, color: colorRec }}>
+            Mercado recomendado: {recomendacionSimple.mercado}
           </div>
-          {analisisSimple.respuestas.partido_cerrado === "si_cerrado" && (
-            <div style={{ marginTop: 8, padding: "7px 10px", background: "rgba(199,84,80,0.1)", border: "1px solid rgba(199,84,80,0.3)", borderRadius: 8, fontSize: 11, color: "#C75450" }}>
-              ⚠️ Partido cerrado detectado — evalúa Menos de 2.5 goles antes de apostar a resultado directo
-            </div>
-          )}
         </div>
         <button onClick={onIrApuestaSimple} style={{ ...styles.saveBtn, width: "100%", marginTop: 4 }}>
           Crear apuesta simple con este análisis →
@@ -783,15 +817,17 @@ function AnalisisPrevioPanel({
       <div style={styles.listSection}>
         <div style={{ ...styles.panelOverallCard, textAlign: "left" }}>
           <div style={{ fontSize: 13, fontWeight: 700, color: "#3FA66B", marginBottom: 8 }}>✅ Análisis guardado</div>
-          {analisisCombinada.filter((b) => b.match.trim()).map((b, idx) => (
-            <div key={idx} style={{ marginBottom: 6 }}>
-              <div style={{ fontSize: 12.5, color: "#F5F1E8", fontWeight: 600 }}>Partido {idx + 1}: {b.match}</div>
-              <div style={{ fontSize: 11, color: "#76705F" }}>{b.competition} · {b.date}</div>
-              {b.respuestas.partido_cerrado === "si_cerrado" && (
-                <div style={{ fontSize: 10.5, color: "#C75450", marginTop: 2 }}>⚠️ Partido cerrado — evalúa Menos de 2.5 goles</div>
-              )}
-            </div>
-          ))}
+          {analisisCombinada.filter((b) => b.match.trim()).map((b, idx) => {
+            const rec = calcularMercadoRecomendado(b.respuestas);
+            const col = rec.tipo === "over" ? "#3FA66B" : rec.tipo === "under" ? "#D4A537" : "#C75450";
+            return (
+              <div key={idx} style={{ marginBottom: 8 }}>
+                <div style={{ fontSize: 12.5, color: "#F5F1E8", fontWeight: 600 }}>Partido {idx + 1}: {b.match}</div>
+                <div style={{ fontSize: 11, color: "#76705F" }}>{b.competition} · {b.date}</div>
+                <div style={{ fontSize: 11, color: col, marginTop: 2 }}>→ {rec.mercado}</div>
+              </div>
+            );
+          })}
         </div>
         <button onClick={onIrCombinada} style={{ ...styles.saveBtn, width: "100%", marginTop: 4 }}>
           Crear combinada con estos análisis →
@@ -821,9 +857,6 @@ function AnalisisPrevioPanel({
               }
             }}
           />
-          <div style={{ fontSize: 11, color: "#76705F", textAlign: "center", marginBottom: 12 }}>
-            {Object.entries(analisisSimple.respuestas).filter(([k]) => k !== "partido_cerrado").filter(([, v]) => v).length} de 6 preguntas respondidas
-          </div>
           <button onClick={onGuardarSimple} disabled={!analisisSimple.match.trim() || guardandoAnalisis}
             style={{ ...styles.saveBtn, width: "100%", opacity: !analisisSimple.match.trim() ? 0.5 : 1 }}>
             {guardandoAnalisis ? "Guardando…" : "Guardar análisis"}
@@ -876,35 +909,61 @@ function AnalisisPrevioPanel({
   return null;
 }
 
-function PerformancePanel({ overallDecided, overallWinRate, byMarket, byLeague, byStake, byLossReason }) {
-  if (overallDecided === 0) {
-    return (
-      <div style={styles.listSection}>
-        <EmptyState text="Aún no hay apuestas resueltas para analizar. Cuando apliques resultados, aquí verás tu rendimiento desglosado." />
-      </div>
-    );
-  }
+function PerformancePanel({ overallDecided, overallWinRate, byMarket, byLeague, byStake, byLossReason, confirmReset, setConfirmReset, resetting, onReset }) {
   return (
     <div style={styles.listSection}>
-      <div style={styles.panelOverallCard}>
-        <div style={styles.panelOverallLabel}>Acierto general</div>
-        <div style={styles.panelOverallValue}>{overallWinRate.toFixed(0)}%</div>
-        <div style={styles.panelOverallSub}>{overallDecided} apuestas/selecciones resueltas</div>
-      </div>
-      <BreakdownSection title="% acierto por mercado" rows={byMarket} />
-      <BreakdownSection title="% acierto por liga/competencia" rows={byLeague} />
-      <BreakdownSection title="% acierto por nivel de stake" rows={byStake} />
-      <div style={styles.panelSectionTitle}>Causas de pérdida más comunes</div>
-      {byLossReason.length === 0 ? (
-        <div style={styles.panelEmptyHint}>Aún no hay causas registradas.</div>
-      ) : (
-        byLossReason.map((r) => (
-          <div key={r.reason} style={styles.lossReasonRow}>
-            <span style={styles.lossReasonText}>{r.reason}</span>
-            <span style={styles.lossReasonCount}>{r.count}×</span>
+      {overallDecided > 0 && (
+        <>
+          <div style={styles.panelOverallCard}>
+            <div style={styles.panelOverallLabel}>Acierto general</div>
+            <div style={styles.panelOverallValue}>{overallWinRate.toFixed(0)}%</div>
+            <div style={styles.panelOverallSub}>{overallDecided} apuestas/selecciones resueltas</div>
           </div>
-        ))
+          <BreakdownSection title="% acierto por mercado" rows={byMarket} />
+          <BreakdownSection title="% acierto por liga/competencia" rows={byLeague} />
+          <BreakdownSection title="% acierto por nivel de stake" rows={byStake} />
+          <div style={styles.panelSectionTitle}>Causas de pérdida más comunes</div>
+          {byLossReason.length === 0 ? (
+            <div style={styles.panelEmptyHint}>Aún no hay causas registradas.</div>
+          ) : (
+            byLossReason.map((r) => (
+              <div key={r.reason} style={styles.lossReasonRow}>
+                <span style={styles.lossReasonText}>{r.reason}</span>
+                <span style={styles.lossReasonCount}>{r.count}×</span>
+              </div>
+            ))
+          )}
+        </>
       )}
+
+      {overallDecided === 0 && (
+        <EmptyState text="Aún no hay apuestas resueltas para analizar. Cuando apliques resultados, aquí verás tu rendimiento desglosado." />
+      )}
+
+      {/* Botón de reinicio total */}
+      <div style={{ marginTop: 24, borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: 16 }}>
+        <div style={styles.panelSectionTitle}>Zona de reinicio</div>
+        <div style={{ fontSize: 11, color: "#76705F", marginBottom: 12, lineHeight: 1.5 }}>
+          Borra todos los datos (apuestas, combinadas, checklists) y resetea la banca a 500.000 CLP. Usar solo antes de empezar a apostar con dinero real.
+        </div>
+        {!confirmReset ? (
+          <button onClick={() => setConfirmReset(true)} style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 7, width: "100%", background: "rgba(199,84,80,0.1)", border: "1px solid rgba(199,84,80,0.3)", color: "#C75450", borderRadius: 10, padding: "12px", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
+            <RotateCcw size={15} /> Reinicio total de la app
+          </button>
+        ) : (
+          <div style={{ background: "rgba(199,84,80,0.08)", border: "1px solid rgba(199,84,80,0.3)", borderRadius: 10, padding: 14 }}>
+            <div style={{ fontSize: 12.5, color: "#C75450", fontWeight: 700, marginBottom: 8 }}>⚠️ ¿Estás seguro? Esta acción no se puede deshacer.</div>
+            <div style={{ fontSize: 11.5, color: "#9A9488", marginBottom: 12 }}>Se borrarán TODOS los datos: apuestas, combinadas, checklists y la banca volverá a 500.000 CLP.</div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => setConfirmReset(false)} style={styles.cancelBtn}>Cancelar</button>
+              <button onClick={onReset} disabled={resetting}
+                style={{ flex: 1.4, background: "#C75450", border: "none", color: "#fff", borderRadius: 9, padding: "11px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+                {resetting ? "Borrando…" : "Sí, borrar todo"}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
